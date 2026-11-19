@@ -1,0 +1,8 @@
+/target/
+**/target/
+*.log
+.env
+.env.*
+!.env.example
+/local-data/
+/recordings/
