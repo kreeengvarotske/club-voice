@@ -10,8 +10,9 @@ This is a delivery order, not a claim that features are implemented or a promise
 | 3 | First live voice path | Intentional device capture/playback, room transport, mute/deafen/PTT and clean shutdown on two clients | Planned |
 | 4 | Voice quality and focused settings | Noise suppression, microphone test, device changes and validated optional processing; synthetic and permitted real-audio evidence | Planned |
 | 5 | Club deployment experience | Host/start/stop UI, discovery, direct-address fallback, password admission, actionable network errors, offline portable packages | Planned |
-| 6 | SDK integration and comparison | Same application behavior with and without SDK, reasonable baseline, owned-process resource/latency receipts | Planned |
-| 7 | Club pilot and release | Two actual PCs, non-developer setup, voice usability and game-impact checks, packaging/security/licenses and reproducible results | Planned |
+| 6 | Internet connectivity and operator deployment | Same server on a reachable remote host, invitations/saved servers, secure admission/control/media, abuse limits and two-network voice/text/reconnect checks | Planned |
+| 7 | SDK integration and comparison | Same application behavior with and without SDK, reasonable baseline, owned-process resource/latency receipts | Planned |
+| 8 | Club and internet pilots, then release | Two club PCs plus independent-network clients, non-developer LAN setup, voice usability/game-impact checks, packaging/security/licenses and reproducible results | Planned |
 
 Implement coherent vertical slices and verify each before expanding scope. Automated codec/network tests do not establish microphone quality or a two-PC deployment. A human/device acceptance check remains necessary.
 

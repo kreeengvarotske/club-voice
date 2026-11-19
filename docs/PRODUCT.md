@@ -70,11 +70,11 @@ Count processes together with total owned client memory, CPU, background activit
 
 Native Rust UI is the current recommendation to avoid WebView2 helper processes. Exact process/memory/FPS/latency claims await implementation and measurement. No promise of zero lag is made for arbitrary hardware, drivers, networks or games.
 
-### R7: Responsible local hosting
+### R7: Responsible network hosting
 
 A join password controls admission but is not a substitute for transport protection. Use established security protocols/libraries; do not invent custom encryption. Bound unauthenticated work, connection attempts, requests and media queues.
 
-Show that a server is running and which interface/address it uses. Internet-facing hosting and its authentication, abuse and deployment requirements need separate qualification; LAN readiness does not establish internet readiness.
+Show that a server is running and which interface/address it uses. Internet-facing hosting is required by R9, with separately verified authentication, transport protection, abuse limits and deployment. LAN readiness does not establish internet readiness. Local hosting must not silently become publicly accessible.
 
 ### R8: Honest SDK evaluation
 
@@ -84,10 +84,23 @@ Compare useful ordinary Rust application behavior against SDK-backed behavior us
 
 Include a fully SDK-excluded build when needed to separate linked-code footprint from runtime behavior. Report improvements, regressions and no difference. Do not attribute a native-interface advantage to the SDK.
 
+### R9: Internet communication in the same client
+
+Players can use voice rooms and text channels with people on other networks, not only on the same LAN. Keep the same client, room semantics, essential voice settings and reconnect behavior in both modes.
+
+A server operator can run the same server software on a reachable remote machine such as a VPS or dedicated host. Players join by a shareable invitation or address, save servers and switch between local and remote servers. Invitations must carry enough server location information to work without an unspecified global invite-code lookup service.
+
+Ordinary joining players should not need to host a server, edit a router or configure port forwarding. Remote operators still need a reachable host and documented endpoint/certificate/network setup. Do not claim that any home PC becomes internet-reachable automatically.
+
+Internet mode requires authenticated sessions, encrypted control and media transport, server identity verification, bounded unauthenticated work, admission/rate limits and usable connection errors. Validate invitation expiry/revocation and basic operator removal/admission controls. Choose established protocols and libraries during technical planning; do not invent crypto.
+
+LAN discovery remains local and does not publish a club server to an internet directory. Managed hosting, centralized accounts, a public server directory and their operational costs/privacy rules are separate future decisions. Self-hosted internet communication must not depend on those services.
+
 ## Acceptance and unresolved details
 
 - First vertical slice: local host plus two real clients exchange text and voice, can mute/PTT, reconnect and shut down cleanly.
 - Club pilot: a non-developer can host and join from at least two Windows PCs without internet, accounts, toolchains or terminal commands, with clear firewall/discovery guidance.
+- Internet pilot: two clients on independent networks exchange voice and text through a reachable server, reconnect, validate admission/server identity and transport protection, and shut down cleanly. A loopback or LAN-only test does not satisfy this requirement.
 - Noise evaluation: representative club noise and speech samples, acquired with permission, demonstrate understandable speech and acceptable processing cost.
 - Gaming evaluation: record hardware, workload, active speakers and game conditions before making latency/resource/frame-time claims.
 - Packaging: test offline first run and retain dependency/model licenses and hashes.
