@@ -8,6 +8,14 @@ The primary product is a lightweight gaming voice client whose main advantage is
 
 The application is a separate product from the released shared-runtime SDK. The SDK's release source, compatibility policy and frozen performance research are unchanged.
 
+## Product identity and references
+
+TeamSpeak 3 is a reference for compact, voice-first gaming workflows. Discord is a reference for modern visual hierarchy and familiar channel navigation. These are design inputs, not verified comparative performance claims or a requirement to reproduce either product's entire feature set.
+
+Players should quickly see their server, team room, participants, speaking/mute state and connection health. Keep microphone, mute/deafen and disconnect controls consistently accessible. Provide a modern original interface with clear text/channel hierarchy and restrained background activity.
+
+Rapid local deployment is the primary differentiator. The first club flow offers a ready-made Lobby / Team A / Team B layout that an administrator can adjust. Advanced community/social features must not delay a usable voice client and local host flow.
+
 ## Requirements
 
 ### R1: Club deployment

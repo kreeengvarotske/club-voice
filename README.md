@@ -1,10 +1,16 @@
 # Club Voice
 
-A planned lightweight gaming voice client with a local-first deployment experience for PC clubs.
+A planned modern, voice-first gaming client with simple LAN hosting for PC clubs.
 
 **Primary outcome:** a club administrator starts a local server and players join from the same LAN without cloud accounts, an internet connection, Docker, a development toolchain or terminal commands.
 
 Working title only. This is a separate local repository from tauri-multi-window-runtime. Current status: product requirements and delivery milestones; the client/server and audio implementation do not exist yet.
+
+## Product direction
+
+Keep the compact voice-first workflow that motivates the TeamSpeak 3 reference, with a modern, channel-oriented interface inspired by Discord. Build an original visual identity and retain only functions that help players communicate while gaming.
+
+The main differentiator is club deployment: start one local server, let players find it, and join a team room with minimal setup. Initial room templates include Lobby, Team A and Team B.
 
 ## First release scope
 
@@ -20,4 +26,4 @@ The released shared-runtime SDK may be consumed as a dependency for appropriate 
 
 See [product requirements](docs/PRODUCT.md) and [delivery milestones](docs/DELIVERY.md).
 
-No remote repository has been created or published.
+Public repository: https://github.com/kreeengvarotske/club-voice . The repository currently contains requirements and delivery milestones; no application release is available.
