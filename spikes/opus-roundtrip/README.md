@@ -28,7 +28,7 @@ cargo run --release --manifest-path spikes\opus-roundtrip\Cargo.toml
 cargo run --release --manifest-path spikes\opus-roundtrip\Cargo.toml -- --frame-ms 20 --bitrate 24000
 ```
 
-If CMake is not on `PATH`, the copy bundled with Visual Studio Build Tools can be used by setting `CMAKE` to its `cmake.exe`. A short `CARGO_TARGET_DIR` (for example `C:\cv-target`) avoids long-path problems in the libopus CMake build.
+If CMake is not on `PATH`, the copy bundled with Visual Studio Build Tools can be used by setting `CMAKE` to its `cmake.exe`. A short `CARGO_TARGET_DIR` (for example `C:\cv-target`) matches the verified Windows build and may help with Windows path-length limits in the libopus CMake build.
 
 Linux/macOS: the same commands with `/` in the path (needs a C compiler and CMake).
 
