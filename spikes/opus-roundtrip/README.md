@@ -16,6 +16,16 @@ Scope: codec only. No audio devices, no network, no server, no wire format. Pack
    - packet-loss concealment output for one missing packet;
    - that two fresh encoders produce byte-identical packets, plus a packet hash for comparing machines/builds.
 
+## Frame API for the media path
+
+`src/frame.rs` exposes the codec one frame at a time for reuse by the process harness or media relay tests:
+
+- `FrameEncoder::new(&Config)`, `encode(&pcm_frame, &mut [u8; MAX_OPUS_PACKET]) -> payload_len`: exactly one 48 kHz mono i16 frame per call, into a caller-owned buffer.
+- `FrameDecoder::new(&Config)`, `decode(Some(packet) | None, &mut out) -> frame_samples`: one packet per call; `None` conceals a lost packet. A packet whose duration differs from the configured frame is rejected.
+- `SyntheticSource::new(&Config)`, `next_frame(&mut out)`: endless deterministic tones (300/1000/2500 Hz), phase-continuous, identical sample sequence for 10 and 20 ms frames.
+
+Supported frames: 10, 20, 40 and 60 ms (`SUPPORTED_FRAME_MS`); only 48 kHz. No per-frame allocation, no queues, no wire format. Use it from another crate with a path dependency, for example `opus-roundtrip-spike = { path = "../../spikes/opus-roundtrip" }`.
+
 ## Commands
 
 From the repository root.
@@ -35,6 +45,8 @@ Linux/macOS: the same commands with `/` in the path (needs a C compiler and CMak
 libopus 1.6.1 is compiled from source bundled in `opusic-sys` 0.7.7 (via `opus` 0.4.0) and linked statically. No system libopus and no download at run time are required. `Cargo.lock` is committed so the dependency versions are fixed.
 
 ## Tests
+
+`tests/frame_api.rs`: one second of synthetic frames streams through `FrameEncoder`/`FrameDecoder` at 10 and 20 ms with tone levels within 1.5 dB; the frame encoder produces the same packets as the batch path; the synthetic source is deterministic and identical across frame sizes; wrong frame lengths, packets of another duration, empty packets, unsupported frame sizes and sample rates are rejected; a lost packet is concealed with a full frame.
 
 `tests/roundtrip.rs`, for 10, 20, 40 and 60 ms frames:
 

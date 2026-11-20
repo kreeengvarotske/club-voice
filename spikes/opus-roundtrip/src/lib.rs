@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 pub use opus::{Application, Channels};
 
+pub mod frame;
+pub use frame::{FrameDecoder, FrameEncoder, SyntheticSource, SUPPORTED_FRAME_MS};
+
 /// Largest legal Opus packet payload (RFC 6716, section 3.2.1).
 pub const MAX_OPUS_PACKET: usize = 1275;
 
@@ -193,12 +196,6 @@ impl From<opus::Error> for SpikeError {
     }
 }
 
-fn new_encoder(cfg: &Config) -> Result<opus::Encoder, SpikeError> {
-    let mut enc = opus::Encoder::new(cfg.sample_rate, Channels::Mono, cfg.application)?;
-    enc.set_bitrate(opus::Bitrate::Bits(cfg.bitrate_bps))?;
-    Ok(enc)
-}
-
 /// Encode `pcm` frame by frame. `pcm.len()` must be a multiple of the frame size.
 pub fn encode_all(cfg: &Config, pcm: &[i16]) -> Result<Vec<Vec<u8>>, SpikeError> {
     let f = cfg.frame_samples();
@@ -208,7 +205,7 @@ pub fn encode_all(cfg: &Config, pcm: &[i16]) -> Result<Vec<Vec<u8>>, SpikeError>
             pcm.len()
         )));
     }
-    let mut enc = new_encoder(cfg)?;
+    let mut enc = FrameEncoder::new(cfg)?;
     let mut buf = [0u8; MAX_OPUS_PACKET];
     let mut packets = Vec::with_capacity(pcm.len() / f);
     for frame in pcm.chunks_exact(f) {
@@ -231,9 +228,7 @@ pub fn run(cfg: &Config) -> Result<Report, SpikeError> {
     }
     let pcm = generate_pcm(cfg);
 
-    let lookahead = new_encoder(cfg)?.get_lookahead()?;
-    let lookahead = usize::try_from(lookahead)
-        .map_err(|_| SpikeError::Invalid(format!("negative lookahead {lookahead}")))?;
+    let lookahead = FrameEncoder::new(cfg)?.lookahead()?;
 
     let t0 = Instant::now();
     let packets = encode_all(cfg, &pcm)?;
