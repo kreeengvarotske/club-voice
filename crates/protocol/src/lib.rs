@@ -5,6 +5,8 @@
 
 use std::collections::VecDeque;
 
+pub mod media;
+
 pub const DEFAULT_ROOMS: [&str; 3] = ["Lobby", "Team A", "Team B"];
 pub const MAX_CONTROL_BYTES: usize = 4 * 1024;
 

@@ -28,9 +28,20 @@ impl LocalHost {
     }
 
     pub fn serve_one(&mut self) -> io::Result<()> {
-        // A full UDP receive buffer also handles oversized datagrams on Windows.
         let mut packet = [0; 65535];
-        let (size, peer) = self.socket.recv_from(&mut packet)?;
+        self.serve_datagram(&mut packet)
+    }
+
+    pub fn serve(&mut self) -> io::Result<()> {
+        // Windows rejects truncated datagrams. Reuse a full UDP buffer across frames.
+        let mut packet = [0; 65535];
+        loop {
+            self.serve_datagram(&mut packet)?;
+        }
+    }
+
+    fn serve_datagram(&mut self, packet: &mut [u8; 65535]) -> io::Result<()> {
+        let (size, peer) = self.socket.recv_from(packet)?;
         let now = Instant::now();
         self.peers.retain(|_, (name, seen)| {
             let live = now.duration_since(*seen) < Duration::from_secs(30);
@@ -40,6 +51,17 @@ impl LocalHost {
             live
         });
         let response = match &packet[..size] {
+            bytes if bytes.starts_with(club_voice_protocol::media::MAGIC) => {
+                if club_voice_protocol::media::Header::parse(bytes).is_some()
+                    && let Some((_, seen)) = self.peers.get_mut(&peer)
+                {
+                    *seen = now;
+                    for other in self.peers.keys().filter(|other| **other != peer) {
+                        self.socket.send_to(bytes, other)?;
+                    }
+                }
+                return Ok(());
+            }
             b"CV1 LEAVE" => {
                 if let Some((name, _)) = self.peers.remove(&peer) {
                     self.rooms.leave_lobby(&name);

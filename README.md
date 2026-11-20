@@ -4,7 +4,7 @@ A planned modern, voice-first gaming client with simple LAN hosting for PC clubs
 
 **Primary outcome:** a club administrator starts a local server and players join from the same LAN without cloud accounts, an internet connection, Docker, a development toolchain or terminal commands.
 
-Working title only. This is a separate local repository from tauri-multi-window-runtime. Current status: product requirements and delivery milestones; the client/server and audio implementation do not exist yet.
+Club Voice is the working title. The Windows development probe sends generated audio between two client processes through a loopback server. It exercises Opus encoding, admission, forwarding and decoding. See the [team handoff](docs/TEAM_HANDOFF.md) to run it.
 
 ## Product direction
 
@@ -34,4 +34,4 @@ The released shared-runtime SDK may be consumed as a dependency for appropriate 
 
 See [product requirements](docs/PRODUCT.md) and [delivery milestones](docs/DELIVERY.md).
 
-Public repository: https://github.com/kreeengvarotske/club-voice . The repository currently contains requirements and delivery milestones; no application release is available.
+Development takes place in the [public repository](https://github.com/kreeengvarotske/club-voice). A playable release is still pending.

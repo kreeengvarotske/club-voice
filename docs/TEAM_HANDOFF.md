@@ -11,11 +11,12 @@ Updated November 20, 2026.
 - `shared-runtime` v0.1.0, pinned to commit `6b87081b2da02560eb8edf098c3654e34b40b34c`, used only for the initial bounded non-audio runtime experiment.
 - CPAL 0.18.2 compiles on Windows. `club-voice-device-check --list-devices` only enumerates devices; it never creates an audio stream and must not be treated as a microphone test.
 
-## What does not exist yet
-
 - The control prototype binds IPv4 localhost and accepts versioned join, leave and heartbeat datagrams. Run `cargo run --locked -p club-voice-server --example two_clients` to check password rejection, concurrent membership, duplicate join, capacity and slot reuse on Windows. The example uses independent sockets within one process. Keep its plaintext test protocol on loopback.
-- GUI, LAN discovery, text transport, Opus, capture/playback streams, PTT, jitter buffer, RNNoise, packaging and internet transport are pending.
-- A real two-client voice path. Do not represent the room-state tests as voice functionality.
+- Two Rust client processes exchange generated Opus through the relay, with one sender in the lobby. The receiver checks sequence continuity, decoded length and the level of three tones. Each comparison uses the same two seconds of 48 kHz mono audio. The timestamps cover the interval from sending an encoded packet to finishing its decode on the same host. Device buffers, frame collection, encoding and playback add further delay in a voice client.
+
+## Pending
+
+Live capture and playback, multiple concurrent speakers, PTT, jitter buffering, LAN discovery, GUI, noise suppression, packaging and internet transport still need implementation and qualification.
 
 ## Non-negotiable constraints
 
@@ -27,21 +28,25 @@ Updated November 20, 2026.
 
 ## Next implementation sequence
 
-1. Agree on the media datagram format with the Opus spike authors in GitHub issue #1. The Windows process smoke test starts one loopback server and two independent players and checks overlapping lobby membership, heartbeat replies and departure.
-2. Add an Opus spike and a deterministic synthetic-audio test before real microphone capture.
+1. Add speaker identity before enabling multiple senders. The experimental CVM1 datagram carries frame duration, sequence, a same-host timing marker and the Opus payload.
+2. Test bounded playout under jitter, packet loss and reordering with the same synthetic source.
 3. Add an explicitly initiated CPAL capture/playback smoke path, with device-error and clean-shutdown handling.
 4. Connect two independent clients through the local server and collect queue, underrun, delay, CPU/RAM, and game-impact receipts.
 5. Add LAN discovery and packaging only after the direct-address voice path works.
 
 ## Commands run successfully
 
+The media example builds bundled libopus and requires CMake and the MSVC C++ build tools. If CMake is bundled with Visual Studio but missing from PATH, set the CMAKE environment variable to its executable for this shell.
+
 ```powershell
 cargo build --locked --workspace --examples
 python crates/server/tests/process_smoke.py
+cargo build --release --locked --workspace --examples --features media-smoke
+python crates/server/tests/media_smoke.py
 cargo test --workspace --all-features
 cargo test --workspace --no-default-features
 cargo fmt --all --check
 git diff --check
 ```
 
-The two Cargo test configurations are intentional: `--all-features` validates the SDK and CPAL integrations, while `--no-default-features` is the initial SDK-excluded baseline.
+The full feature build checks the SDK, CPAL and codec integrations. For SDK performance comparisons, hold all other features fixed. The minimal build also removes audio features.

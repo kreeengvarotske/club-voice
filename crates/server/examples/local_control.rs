@@ -12,7 +12,5 @@ fn main() -> io::Result<()> {
     )?;
     println!("{}", host.address()?);
     io::stdout().flush()?;
-    loop {
-        host.serve_one()?;
-    }
+    host.serve()
 }

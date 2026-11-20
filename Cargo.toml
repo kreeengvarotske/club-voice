@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["spikes/opus-roundtrip"]
 members = [
   "crates/client",
   "crates/protocol",
