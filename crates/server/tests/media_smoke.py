@@ -46,3 +46,20 @@ for duration in ("10", "20"):
         if sender.returncode or receiver.returncode:
             raise RuntimeError(f"media probe failed at {duration} ms")
         print(report.strip())
+
+with ExitStack() as stack:
+    address = ready_line(launch(stack, "local_control"))
+    peers = [launch(stack, "headset_player", address, name, "--tone-peer")
+             for name in ("Ada", "Lin")]
+    for peer in peers:
+        report, _ = peer.communicate(timeout=10)
+        if peer.returncode:
+            raise RuntimeError("duplex headset simulation failed")
+        print(report.strip())
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as late:
+        host, port = address.rsplit(":", 1)
+        late.connect((host, int(port)))
+        late.settimeout(2)
+        late.send(b"CV1 JOIN\x00Fresh\x00test")
+        if late.recv(32) != b"LOBBY":
+            raise RuntimeError("fresh player could not join after departure")

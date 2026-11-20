@@ -41,7 +41,11 @@ impl LocalHost {
     }
 
     fn serve_datagram(&mut self, packet: &mut [u8; 65535]) -> io::Result<()> {
-        let (size, peer) = self.socket.recv_from(packet)?;
+        let (size, peer) = match self.socket.recv_from(packet) {
+            // Windows reports ICMP port-unreachable from a previous send here.
+            Err(e) if cfg!(windows) && e.kind() == io::ErrorKind::ConnectionReset => return Ok(()),
+            other => other?,
+        };
         let now = Instant::now();
         self.peers.retain(|_, (name, seen)| {
             let live = now.duration_since(*seen) < Duration::from_secs(30);

@@ -7,8 +7,8 @@ Updated November 20, 2026.
 - A Rust workspace with `club-voice-protocol`, `club-voice-server`, and `club-voice-client` crates.
 - Default Lobby / Team A / Team B room state, password admission, and a server member limit.
 - A bounded control-plane queue with observable drops. It is not an audio queue.
-- A client capture gate that starts in `Idle`; no microphone stream exists or opens by default.
-- `shared-runtime` v0.1.0, pinned to commit `6b87081b2da02560eb8edf098c3654e34b40b34c`, used only for the initial bounded non-audio runtime experiment.
+- The headset example requires explicit microphone activation. The automated duplex test uses a generated signal.
+- The SDK-backed device diagnostic reads a shared inventory snapshot through `shared-runtime` v0.1.0. The metadata operation has a 32 KiB cache budget and a two-second TTL. A fixture test makes concurrent picker and settings requests and verifies one enumeration and one shared result.
 - CPAL 0.18.2 compiles on Windows. `club-voice-device-check --list-devices` only enumerates devices; it never creates an audio stream and must not be treated as a microphone test.
 
 - The control prototype binds IPv4 localhost and accepts versioned join, leave and heartbeat datagrams. Run `cargo run --locked -p club-voice-server --example two_clients` to check password rejection, concurrent membership, duplicate join, capacity and slot reuse on Windows. The example uses independent sockets within one process. Keep its plaintext test protocol on loopback.
@@ -16,7 +16,22 @@ Updated November 20, 2026.
 
 ## Pending
 
-Live capture and playback, multiple concurrent speakers, PTT, jitter buffering, LAN discovery, GUI, noise suppression, packaging and internet transport still need implementation and qualification.
+Physical headset acceptance, rooms with more than two participants, PTT, jitter buffering, LAN discovery, GUI, noise suppression, packaging and internet transport remain open.
+
+## Two-seat headset check on Windows
+
+Build the release examples using the commands below. Start `target/release/examples/local_control.exe` and copy the printed loopback address. Each client takes one seat.
+
+- For a manual check, run `target/release/examples/headset_player.exe ADDRESS Ada --enable-microphone`. This activates the Windows default microphone and plays the other seat through the default output. The current device adapter requires 48 kHz float input and output. Use headphones and start with low playback volume. Type `mute`, `unmute`, `deafen`, `undeafen` or `quit` followed by Enter. A device stream error ends the session and reports the cause.
+- For a three-second generated peer, run `target/release/examples/headset_player.exe ADDRESS Lin --tone-peer`. Speak during this interval and check whether the tone peer reports received audio. Its output meter counts 20 ms blocks that cross an amplitude threshold. A human listening at both ends is still needed to judge speech quality.
+- For unattended verification, run `python crates/server/tests/media_smoke.py`. Its duplex case starts two synthetic peers and exercises the same capture framing, codec workers, queues and playback conversion used by the headset command. The server accepts another player after both exit.
+- For per-process CPU and memory on Windows, run `./crates/server/tests/windows_resources.ps1` in PowerShell 7. The script runs two synthetic peers, samples working set and private bytes once a second for 30 seconds, and reports CPU as a percentage of one logical core. Audio drivers, a GUI and the game are outside this workload.
+
+Each client uses two bounded queues of two 20 ms frames each. An 80 ms age check discards expired frames. The loopback probe uses a shared host clock. Each client receives a single remote stream.
+
+To use two different headsets on one PC, run `cargo run --release -p club-voice-client --bin club-voice-device-check -- --list-devices`. In each player's PowerShell window, set `$env:CLUB_VOICE_INPUT_ID` and `$env:CLUB_VOICE_OUTPUT_ID` to the corresponding printed IDs before starting the headset example. Omit either variable to use the Windows default for that direction.
+
+On November 20, a 30-second Windows release sample with two synthetic duplex clients reported 7.75 MiB sampled peak working set and 1.38 MiB private bytes per client. CPU averaged 3.12% and 3.38% of one logical core. The server used 5.11 MiB working set, 0.78 MiB private bytes and 0.86% of one core. Treat these as local development measurements.
 
 ## Non-negotiable constraints
 
@@ -30,7 +45,7 @@ Live capture and playback, multiple concurrent speakers, PTT, jitter buffering, 
 
 1. Add speaker identity before enabling multiple senders. The experimental CVM1 datagram carries frame duration, sequence, a same-host timing marker and the Opus payload.
 2. Test bounded playout under jitter, packet loss and reordering with the same synthetic source.
-3. Add an explicitly initiated CPAL capture/playback smoke path, with device-error and clean-shutdown handling.
+3. Run the manual headset check and document device names, formats, heard speech, mute/deafen, unplug and shutdown outcomes with the tester's permission.
 4. Connect two independent clients through the local server and collect queue, underrun, delay, CPU/RAM, and game-impact receipts.
 5. Add LAN discovery and packaging only after the direct-address voice path works.
 

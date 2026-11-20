@@ -7,7 +7,7 @@ pub mod devices {
     //! Device enumeration only. This module never builds an input or output
     //! stream, so it cannot start microphone capture or playback.
 
-    use cpal::traits::HostTrait;
+    use cpal::traits::{DeviceTrait, HostTrait};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct AudioDevices {
@@ -40,9 +40,18 @@ pub mod devices {
     where
         I: IntoIterator<Item = cpal::Device>,
     {
-        devices.into_iter().map(name).collect()
+        devices
+            .into_iter()
+            .map(|device| match device.id() {
+                Ok(id) => format!("{device}  [id={id}]"),
+                Err(_) => name(device),
+            })
+            .collect()
     }
 }
+
+#[cfg(all(feature = "sdk-evaluation", feature = "audio-device-probe"))]
+pub mod device_inventory;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureState {
@@ -99,7 +108,7 @@ pub fn build_sdk_runtime() -> shared_runtime::Runtime {
     use shared_runtime::{Runtime, RuntimeConfig};
     use std::time::Duration;
 
-    Runtime::builder(RuntimeConfig {
+    let builder = Runtime::builder(RuntimeConfig {
         max_concurrent_operations: 2,
         max_queued_operations: 4,
         max_concurrent_projections: 2,
@@ -108,8 +117,10 @@ pub fn build_sdk_runtime() -> shared_runtime::Runtime {
         shutdown_grace: Duration::from_millis(250),
         cache_budget_bytes: 64 * 1024,
     })
-    .expect("fixed runtime limits are valid")
-    .build()
+    .expect("fixed runtime limits are valid");
+    #[cfg(feature = "audio-device-probe")]
+    let builder = device_inventory::register(builder, devices::enumerate);
+    builder.build()
 }
 
 #[cfg(test)]

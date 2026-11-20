@@ -81,6 +81,7 @@ dependencies = [
  "cpal",
  "opus-roundtrip-spike",
  "shared-runtime",
+ "tokio",
 ]
 
 [[package]]
