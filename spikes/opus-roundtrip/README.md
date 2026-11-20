@@ -28,6 +28,8 @@ cargo run --release --manifest-path spikes\opus-roundtrip\Cargo.toml
 cargo run --release --manifest-path spikes\opus-roundtrip\Cargo.toml -- --frame-ms 20 --bitrate 24000
 ```
 
+If CMake is not on `PATH`, the copy bundled with Visual Studio Build Tools can be used by setting `CMAKE` to its `cmake.exe`. A short `CARGO_TARGET_DIR` (for example `C:\cv-target`) avoids long-path problems in the libopus CMake build.
+
 Linux/macOS: the same commands with `/` in the path (needs a C compiler and CMake).
 
 libopus 1.6.1 is compiled from source bundled in `opusic-sys` 0.7.7 (via `opus` 0.4.0) and linked statically. No system libopus and no download at run time are required. `Cargo.lock` is committed so the dependency versions are fixed.
@@ -57,7 +59,7 @@ Linux x86_64 (cloud container, Intel Xeon 2.3 GHz), Rust 1.97.0, release build, 
 
 Encoding plus decoding 2.5 s of audio took about 11 ms in each case on that machine (single run, not a benchmark).
 
-Windows results: not yet recorded.
+Windows (reported on PR #2 by the repository owner, commit f14d393): all 7 release-mode round-trip tests passed with bundled libopus 1.6.1 and the MSVC toolchain. The build used the `cmake.exe` bundled with Visual Studio Build Tools (passed through the `CMAKE` environment variable) and a short `CARGO_TARGET_DIR`. The `cargo run` report numbers for Windows are not recorded here yet.
 
 ## Notes for the voice path
 
