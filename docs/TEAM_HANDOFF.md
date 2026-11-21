@@ -29,11 +29,11 @@ Build the release examples using the commands below. Start `target/release/examp
 
 Each client uses two bounded queues of two 20 ms frames each. An 80 ms age check discards expired frames. The loopback probe uses a shared host clock. Each client receives a single remote stream.
 
-When a peer rejoins, the listener resets its Opus decoder and discards queued or partially played audio from the previous session. Within one stream it skips duplicate and late sequence numbers. The client sends a heartbeat every five seconds and ends the session after fifteen seconds without forwarded media or a heartbeat reply.
+When a peer rejoins, the listener resets its Opus decoder and discards queued or partially played audio from the previous session. Within one stream it immediately conceals one missing 20 ms frame through Opus PLC, skips duplicate and late frames, and resets the decoder after a longer burst instead of generating an unbounded recovery backlog. The client sends a heartbeat every five seconds and ends the session after fifteen seconds without forwarded media or a heartbeat reply.
 
 To use two different headsets on one PC, run `cargo run --release -p club-voice-client --bin club-voice-device-check -- --list-devices`. In each player's PowerShell window, set `$env:CLUB_VOICE_INPUT_ID` and `$env:CLUB_VOICE_OUTPUT_ID` to the corresponding printed IDs before starting the headset example. Omit either variable to use the Windows default for that direction.
 
-On November 20, a 30-second Windows release sample with two synthetic duplex clients using CVM2 reported 7.75 and 7.81 MiB sampled peak working set, 1.38 and 1.44 MiB private bytes, and 2.20% and 2.15% average CPU relative to one logical core. The server used 5.11 MiB working set, 0.78 MiB private bytes and 0.36% of one core. A separate run measured same-host send-to-decode p95 of 257 µs with 10 ms frames and 339 µs with 20 ms frames. Game frame time, input latency and physical mouth-to-ear delay still need hardware measurements.
+On November 21, a 30-second Windows release sample with two synthetic duplex clients using CVM2 and the bounded PLC path reported 8.70 MiB sampled peak working set, 1.45 and 1.46 MiB private bytes, and 1.84% and 1.38% average CPU relative to one logical core. The server used 5.79 MiB working set, 0.84 MiB private bytes and 0.36% of one core. The same build measured same-host send-to-decode p95 of 257 µs with 10 ms frames and 329 µs with 20 ms frames. Game frame time, input latency and physical mouth-to-ear delay still need hardware measurements.
 
 ## Non-negotiable constraints
 

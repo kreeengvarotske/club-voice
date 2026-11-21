@@ -9,12 +9,14 @@ from queue import Queue
 from threading import Thread
 
 
-def launch(stack, name, *args, seconds=None, stderr=None):
+def launch(stack, name, *args, seconds=None, stderr=None, drop_sequence=None):
     root = Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "release/examples"
     exe = root / (name + (".exe" if os.name == "nt" else ""))
     env = dict(os.environ)
     if seconds is not None:
         env["CLUB_VOICE_PROBE_SECONDS"] = str(seconds)
+    if drop_sequence is not None:
+        env["CLUB_VOICE_PROBE_DROP_SEQUENCE"] = str(drop_sequence)
     child = Popen([exe, *args], stdout=PIPE, stderr=stderr, text=True, env=env)
     stack.callback(child.wait, timeout=5)
     stack.callback(child.kill)
@@ -82,6 +84,22 @@ with ExitStack() as stack:
     if listener.returncode or "streams_heard=2" not in report:
         raise RuntimeError(f"listener did not switch streams: {report}")
     print("Speaker replacement:", report.strip())
+
+# Drop one frame at the listener. The next packet must advance the Opus state
+# through one PLC frame without waiting for retransmission or growing a queue.
+with ExitStack() as stack:
+    address = ready_line(launch(stack, "local_control"))
+    listener = launch(stack, "headset_player", address, "Loss listener", "--tone-peer",
+                      seconds=6, drop_sequence=50)
+    if ready_line(listener) != "READY":
+        raise RuntimeError("loss listener failed to join")
+    peer = launch(stack, "headset_player", address, "Loss sender", "--tone-peer", seconds=3)
+    peer_report, _ = peer.communicate(timeout=6)
+    listener_report, _ = listener.communicate(timeout=7)
+    if peer.returncode or listener.returncode or "concealed=1" not in listener_report:
+        raise RuntimeError(
+            f"single-loss PLC failed: sender={peer_report} listener={listener_report}")
+    print("Single-frame loss:", listener_report.strip())
 
 # Reuse the same UDP socket. Delayed media and leave from the former session
 # must have no effect on the new one, even when name and port both match.

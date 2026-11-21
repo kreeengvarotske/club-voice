@@ -24,6 +24,28 @@ const N: usize = 960;
 const MAX_AGE: Duration = Duration::from_millis(80);
 const HEARTBEAT: Duration = Duration::from_secs(5);
 type Frame = (Instant, [i16; N]);
+type PlaybackFrame = (u64, Frame);
+
+struct PlaybackBatch {
+    first: PlaybackFrame,
+    second: Option<PlaybackFrame>,
+}
+
+impl PlaybackBatch {
+    fn one(stream: u64, frame: Frame) -> Self {
+        Self {
+            first: (stream, frame),
+            second: None,
+        }
+    }
+
+    fn recovered(stream: u64, concealed: Frame, current: Frame) -> Self {
+        Self {
+            first: (stream, concealed),
+            second: Some((stream, current)),
+        }
+    }
+}
 
 #[derive(Default)]
 struct State {
@@ -32,6 +54,7 @@ struct State {
     deafened: AtomicBool,
     dropped_capture: AtomicU64,
     dropped_playback: AtomicU64,
+    concealed: AtomicU64,
     sent: AtomicU64,
     received: AtomicU64,
     remote_stream: AtomicU64,
@@ -72,10 +95,11 @@ fn capture(channels: usize, tx: SyncSender<Frame>, state: Arc<State>) -> impl Fn
 
 fn playback(
     channels: usize,
-    rx: Receiver<(u64, Frame)>,
+    rx: Receiver<PlaybackBatch>,
     state: Arc<State>,
 ) -> impl FnMut(&mut [f32]) {
     let mut current = None;
+    let mut pending = None;
     let mut pos = 0;
     move |samples| {
         samples.fill(0.0);
@@ -83,6 +107,7 @@ fn playback(
         let active = state.remote_stream.load(Relaxed);
         if state.deafened.load(Relaxed) {
             current = None;
+            pending = None;
             while rx.try_recv().is_ok() {}
             return;
         }
@@ -94,7 +119,12 @@ fn playback(
                 if current.take().is_some() {
                     state.dropped_playback.fetch_add(1, Relaxed);
                 }
-                current = rx.try_recv().ok();
+                current = pending.take().or_else(|| {
+                    rx.try_recv().ok().map(|batch| {
+                        pending = batch.second;
+                        batch.first
+                    })
+                });
                 pos = 0;
                 if current.is_none() {
                     return;
@@ -150,9 +180,16 @@ fn transmit(socket: &UdpSocket, rx: Receiver<Frame>, state: &State, stream: u64)
     Ok(())
 }
 
-fn receive(socket: &UdpSocket, tx: SyncSender<(u64, Frame)>, state: &State) -> Result<()> {
+fn receive(
+    socket: &UdpSocket,
+    tx: SyncSender<PlaybackBatch>,
+    state: &State,
+    mut probe_drop_sequence: Option<u32>,
+) -> Result<()> {
     let mut decoder = FrameDecoder::new(&Config::default())?;
     let mut packet = [0; MAX_DATAGRAM + 1];
+    let mut frame = [0; N];
+    let mut concealed = [0; N];
     let mut active = 0;
     let mut last_sequence = 0;
     let mut server_seen = Instant::now();
@@ -186,6 +223,10 @@ fn receive(socket: &UdpSocket, tx: SyncSender<(u64, Frame)>, state: &State) -> R
         if header.frame_ms != 20 || state.deafened.load(Relaxed) {
             continue;
         }
+        if probe_drop_sequence == Some(header.sequence) {
+            probe_drop_sequence = None;
+            continue;
+        }
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros();
         let Some(age) = now
             .checked_sub(header.sent_us.into())
@@ -195,38 +236,78 @@ fn receive(socket: &UdpSocket, tx: SyncSender<(u64, Frame)>, state: &State) -> R
             continue;
         };
         let at = Instant::now() - Duration::from_micros(age as u64);
-        if header.stream < active
-            || header.stream == 0
-            || (header.stream == active && !newer_sequence(header.sequence, last_sequence))
-        {
+        if header.stream == 0 {
             state.dropped_playback.fetch_add(1, Relaxed);
             continue;
         }
-        if header.stream > active {
+        let new_stream = header.stream > active;
+        let distance = if new_stream {
+            1
+        } else if header.stream == active {
+            let Some(distance) = forward_distance(header.sequence, last_sequence) else {
+                state.dropped_playback.fetch_add(1, Relaxed);
+                continue;
+            };
+            distance
+        } else {
+            state.dropped_playback.fetch_add(1, Relaxed);
+            continue;
+        };
+        if new_stream {
             decoder.reset()?;
         }
-        let mut frame = [0; N];
-        if decoder.decode(Some(payload), &mut frame).is_err() {
-            state.dropped_playback.fetch_add(1, Relaxed);
-            continue;
-        }
-        state.received.fetch_add(1, Relaxed);
-        last_sequence = header.sequence;
-        if header.stream > active {
+        let recovered =
+            match decode_after_gap(&mut decoder, distance, payload, &mut frame, &mut concealed) {
+                Ok(recovered) => recovered,
+                Err(_) => {
+                    state.dropped_playback.fetch_add(1, Relaxed);
+                    continue;
+                }
+            };
+        if new_stream {
             active = header.stream;
             state.remote_stream.store(active, Relaxed);
             state.streams_heard.fetch_add(1, Relaxed);
         }
-        if tx.try_send((active, (at, frame))).is_err() {
+        let batch = if recovered {
+            state.concealed.fetch_add(1, Relaxed);
+            let concealed_at = at.checked_sub(Duration::from_millis(20)).unwrap_or(at);
+            PlaybackBatch::recovered(header.stream, (concealed_at, concealed), (at, frame))
+        } else {
+            PlaybackBatch::one(header.stream, (at, frame))
+        };
+        if tx.try_send(batch).is_err() {
             state.dropped_playback.fetch_add(1, Relaxed);
         }
+        state.received.fetch_add(1, Relaxed);
+        last_sequence = header.sequence;
     }
     Ok(())
 }
 
-fn newer_sequence(sequence: u32, previous: u32) -> bool {
-    // Forward half of the wrapping sequence space. Reject duplicates and late frames.
-    matches!(sequence.wrapping_sub(previous), 1..=0x7fff_ffff)
+fn forward_distance(sequence: u32, previous: u32) -> Option<u32> {
+    let distance = sequence.wrapping_sub(previous);
+    matches!(distance, 1..=0x7fff_ffff).then_some(distance)
+}
+
+fn decode_after_gap(
+    decoder: &mut FrameDecoder,
+    distance: u32,
+    payload: &[u8],
+    current: &mut [i16; N],
+    concealed: &mut [i16; N],
+) -> Result<bool> {
+    let recovered = distance == 2;
+    if recovered {
+        decoder.decode(None, concealed)?;
+    } else if distance > 2 {
+        decoder.reset()?;
+    }
+    if let Err(error) = decoder.decode(Some(payload), current) {
+        decoder.reset()?;
+        return Err(error.into());
+    }
+    Ok(recovered)
 }
 
 fn main() -> Result<()> {
@@ -295,7 +376,7 @@ fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
     let o = config(output.supported_output_configs()?)?;
     let state = Arc::new(State::default());
     let (cap_tx, cap_rx) = mpsc::sync_channel(2);
-    let (play_tx, play_rx) = mpsc::sync_channel(2);
+    let (play_tx, play_rx) = mpsc::sync_channel(1);
     let (stop, done) = mpsc::sync_channel::<Result<()>>(1);
     let on_error = || {
         let stop = stop.clone();
@@ -344,7 +425,7 @@ fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
             let _ = stop.try_send(transmit(socket, cap_rx, &state, stream));
         });
         scope.spawn(|| {
-            let _ = stop.try_send(receive(socket, play_tx, &state));
+            let _ = stop.try_send(receive(socket, play_tx, &state, None));
         });
         let result = done.recv();
         state.running.store(false, Relaxed);
@@ -371,8 +452,12 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
         return Err("probe duration must be 3..300 seconds".into());
     }
     let state = Arc::new(State::default());
+    let probe_drop_sequence = env::var("CLUB_VOICE_PROBE_DROP_SEQUENCE")
+        .ok()
+        .map(|value| value.parse::<u32>())
+        .transpose()?;
     let (cap_tx, cap_rx) = mpsc::sync_channel(2);
-    let (play_tx, play_rx) = mpsc::sync_channel(2);
+    let (play_tx, play_rx) = mpsc::sync_channel(1);
     let mut record = capture(1, cap_tx, state.clone());
     let mut render = playback(2, play_rx, state.clone());
     let input: [f32; N] =
@@ -384,7 +469,7 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
     let mut audible = 0;
     thread::scope(|scope| -> Result<()> {
         let sender = scope.spawn(|| transmit(socket, cap_rx, &state, stream));
-        let receiver = scope.spawn(|| receive(socket, play_tx, &state));
+        let receiver = scope.spawn(|| receive(socket, play_tx, &state, probe_drop_sequence));
         let start = Instant::now();
         for i in 1..=seconds * 50 {
             if receiver.is_finished() || sender.is_finished() {
@@ -405,9 +490,10 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
         Ok(())
     })?;
     println!(
-        "sent={} decoded={} audible_blocks={} streams_heard={}",
+        "sent={} decoded={} concealed={} audible_blocks={} streams_heard={}",
         state.sent.load(Relaxed),
         state.received.load(Relaxed),
+        state.concealed.load(Relaxed),
         audible,
         state.streams_heard.load(Relaxed)
     );
@@ -421,11 +507,81 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn sequence_order_accepts_loss_and_wraparound() {
-        assert!(newer_sequence(0, u32::MAX));
-        assert!(newer_sequence(6, 3));
-        assert!(!newer_sequence(3, 3));
-        assert!(!newer_sequence(u32::MAX, 0));
+    fn sequence_distance_accepts_loss_and_wraparound() {
+        assert_eq!(forward_distance(0, u32::MAX), Some(1));
+        assert_eq!(forward_distance(6, 3), Some(3));
+        assert_eq!(forward_distance(3, 3), None);
+        assert_eq!(forward_distance(u32::MAX, 0), None);
+    }
+
+    #[test]
+    fn decoder_conceals_one_loss_and_resets_after_a_burst() {
+        let cfg = Config::default();
+        let mut encoder = FrameEncoder::new(&cfg).unwrap();
+        let mut decoder = FrameDecoder::new(&cfg).unwrap();
+        let input = [4000; N];
+        let mut payload = [0; MAX_OPUS_PACKET];
+        let mut current = [0; N];
+        let mut concealed = [0; N];
+        let size = encoder.encode(&input, &mut payload).unwrap();
+        decoder
+            .decode(Some(&payload[..size]), &mut current)
+            .unwrap();
+        encoder.encode(&input, &mut payload).unwrap();
+        let size = encoder.encode(&input, &mut payload).unwrap();
+        assert!(
+            decode_after_gap(
+                &mut decoder,
+                2,
+                &payload[..size],
+                &mut current,
+                &mut concealed
+            )
+            .unwrap()
+        );
+        assert!(concealed.iter().any(|sample| *sample != 0));
+        assert!(
+            !decode_after_gap(
+                &mut decoder,
+                4,
+                &payload[..size],
+                &mut current,
+                &mut concealed
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn recovered_audio_is_queued_atomically_and_in_order() {
+        let state = Arc::new(State::default());
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(PlaybackBatch::recovered(
+            1,
+            (Instant::now(), [8192; N]),
+            (Instant::now(), [16384; N]),
+        ))
+        .unwrap();
+        let mut render = playback(1, rx, state);
+        let mut output = [0.0; N * 2];
+        render(&mut output);
+        assert!(output[..N].iter().all(|sample| *sample == 0.25));
+        assert!(output[N..].iter().all(|sample| *sample == 0.5));
+
+        let (tx, _rx) = mpsc::sync_channel(1);
+        tx.send(PlaybackBatch::one(1, (Instant::now(), [0; N])))
+            .unwrap();
+        let error = tx
+            .try_send(PlaybackBatch::recovered(
+                1,
+                (Instant::now(), [8192; N]),
+                (Instant::now(), [16384; N]),
+            ))
+            .unwrap_err();
+        let mpsc::TrySendError::Full(batch) = error else {
+            panic!("recovery batch unexpectedly disconnected");
+        };
+        assert!(batch.second.is_some());
     }
 
     #[test]
@@ -435,12 +591,15 @@ mod tests {
         let mut render = playback(1, rx, state.clone());
         let mut sample = [0.0];
         state.remote_stream.store(1, Relaxed);
-        tx.send((1, (Instant::now(), [16384; N]))).unwrap();
+        tx.send(PlaybackBatch::one(1, (Instant::now(), [16384; N])))
+            .unwrap();
         render(&mut sample);
         assert_eq!(sample, [0.5]);
-        tx.send((1, (Instant::now(), [16384; N]))).unwrap();
+        tx.send(PlaybackBatch::one(1, (Instant::now(), [16384; N])))
+            .unwrap();
         state.remote_stream.store(2, Relaxed);
-        tx.send((2, (Instant::now(), [-16384; N]))).unwrap();
+        tx.send(PlaybackBatch::one(2, (Instant::now(), [-16384; N])))
+            .unwrap();
         render(&mut sample);
         assert_eq!(sample, [-0.5]);
         assert_eq!(state.dropped_playback.load(Relaxed), 2);
@@ -450,8 +609,10 @@ mod tests {
     fn stereo_callback_spans_frames_and_pads_underrun_with_silence() {
         let state = Arc::new(State::default());
         let (tx, rx) = mpsc::sync_channel(2);
-        tx.send((1, (Instant::now(), [16384; N]))).unwrap();
-        tx.send((1, (Instant::now(), [-16384; N]))).unwrap();
+        tx.send(PlaybackBatch::one(1, (Instant::now(), [16384; N])))
+            .unwrap();
+        tx.send(PlaybackBatch::one(1, (Instant::now(), [-16384; N])))
+            .unwrap();
         let mut render = playback(2, rx, state);
         let mut first = [0.0; 2 * (N + 3)];
         render(&mut first);
@@ -480,9 +641,13 @@ mod tests {
     fn playback_expires_old_frames_and_deafen_discards_remainder() {
         let state = Arc::new(State::default());
         let (tx, rx) = mpsc::sync_channel(2);
-        tx.send((0, (Instant::now() - Duration::from_secs(1), [-1000; N])))
+        tx.send(PlaybackBatch::one(
+            0,
+            (Instant::now() - Duration::from_secs(1), [-1000; N]),
+        ))
+        .unwrap();
+        tx.send(PlaybackBatch::one(0, (Instant::now(), [16384; N])))
             .unwrap();
-        tx.send((0, (Instant::now(), [16384; N]))).unwrap();
         let mut render = playback(2, rx, state.clone());
         let mut pair = [0.0; 2];
         render(&mut pair);
