@@ -1,0 +1,36 @@
+[package]
+name = "club-voice-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["sdk-evaluation", "audio-device-probe"]
+sdk-evaluation = ["dep:shared-runtime", "dep:tokio"]
+audio-device-probe = ["dep:cpal"]
+media-smoke = ["dep:opus-roundtrip-spike"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "time"], optional = true }
+opus-roundtrip-spike = { path = "../../spikes/opus-roundtrip", optional = true }
+club-voice-protocol = { path = "../protocol" }
+shared-runtime = { git = "https://github.com/kreeengvarotske/tauri-multi-window-runtime.git", rev = "6b87081b2da02560eb8edf098c3654e34b40b34c", package = "shared-runtime", optional = true }
+cpal = { version = "0.18.2", optional = true }
+
+[[bin]]
+name = "club-voice-device-check"
+path = "src/bin/club-voice-device-check.rs"
+required-features = ["audio-device-probe"]
+
+[[example]]
+name = "synthetic_player"
+required-features = ["media-smoke"]
+
+[[example]]
+name = "headset_player"
+required-features = ["media-smoke", "audio-device-probe"]
+
+[lints]
+workspace = true

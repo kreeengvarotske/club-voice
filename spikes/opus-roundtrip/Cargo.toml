@@ -1,0 +1,16 @@
+[package]
+name = "opus-roundtrip-spike"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.87"
+publish = false
+description = "Bounded spike: Opus encode/decode round-trip on generated PCM (Issue #1)."
+
+# Standalone crate: keep it out of any future root workspace until the
+# workspace layout is agreed in Issue #1.
+[workspace]
+
+[dependencies]
+# Safe bindings; pulls opusic-sys, which builds the bundled libopus (1.6.1)
+# with CMake. No system libopus or network access is needed at run time.
+opus = "=0.4.0"
