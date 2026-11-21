@@ -9,10 +9,13 @@ from queue import Queue
 from threading import Thread
 
 
-def launch(stack, name, *args):
+def launch(stack, name, *args, seconds=None, stderr=None):
     root = Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "release/examples"
     exe = root / (name + (".exe" if os.name == "nt" else ""))
-    child = Popen([exe, *args], stdout=PIPE, text=True)
+    env = dict(os.environ)
+    if seconds is not None:
+        env["CLUB_VOICE_PROBE_SECONDS"] = str(seconds)
+    child = Popen([exe, *args], stdout=PIPE, stderr=stderr, text=True, env=env)
     stack.callback(child.wait, timeout=5)
     stack.callback(child.kill)
     return child
@@ -36,7 +39,7 @@ for duration in ("10", "20"):
             host, port = address.rsplit(":", 1)
             outsider.connect((host, int(port)))
             outsider.settimeout(3)
-            outsider.send(struct.pack("!4sBIQ", b"CVM1", int(duration), 999, 0) + b"x")
+            outsider.send(struct.pack("!4sBIQQ", b"CVM2", int(duration), 999, 0, 1) + b"x")
             outsider.send(b"CV1 PING")
             if outsider.recv(32) != b"JOIN_REQUIRED":
                 raise RuntimeError("unadmitted peer received an unexpected response")
@@ -63,3 +66,77 @@ with ExitStack() as stack:
         late.send(b"CV1 JOIN\x00Fresh\x00test")
         if late.recv(32) != b"LOBBY":
             raise RuntimeError("fresh player could not join after departure")
+
+# One listener stays connected while two consecutive participants restart at sequence zero.
+with ExitStack() as stack:
+    address = ready_line(launch(stack, "local_control"))
+    listener = launch(stack, "headset_player", address, "Listener", "--tone-peer", seconds=9)
+    if ready_line(listener) != "READY":
+        raise RuntimeError("listener failed to join")
+    for _ in range(2):
+        peer = launch(stack, "headset_player", address, "Same display name", "--tone-peer", seconds=3)
+        report, _ = peer.communicate(timeout=6)
+        if peer.returncode or "streams_heard=1" not in report:
+            raise RuntimeError(f"replacement peer failed: {report}")
+    report, _ = listener.communicate(timeout=6)
+    if listener.returncode or "streams_heard=2" not in report:
+        raise RuntimeError(f"listener did not switch streams: {report}")
+    print("Speaker replacement:", report.strip())
+
+# Reuse the same UDP socket. Delayed media and leave from the former session
+# must have no effect on the new one, even when name and port both match.
+with ExitStack() as stack:
+    address = ready_line(launch(stack, "local_control"))
+    host, port = address.rsplit(":", 1)
+
+    def connect():
+        peer = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+        peer.connect((host, int(port)))
+        peer.settimeout(2)
+        return peer
+
+    def join(peer):
+        peer.send(b"CV2 JOIN\0Test\0test")
+        tag, stream = struct.unpack("!4sQ", peer.recv(32))
+        if tag != b"CV2A" or not stream:
+            raise RuntimeError("invalid session response")
+        return stream
+
+    def media(stream):
+        return struct.pack("!4sBIQQ", b"CVM2", 20, 0, 0, stream) + b"x"
+
+    listener, sender = connect(), connect()
+    join(listener)
+    old = join(sender)
+    if join(sender) != old:
+        raise RuntimeError("duplicate admission changed stream")
+    leave = struct.pack("!4sQ", b"CV2L", old)
+    sender.send(leave)
+    if sender.recv(32) != b"LEFT":
+        raise RuntimeError("expected leave confirmation")
+    new = join(sender)
+    if new <= old:
+        raise RuntimeError("session identity was recycled")
+    sender.send(leave)
+    sender.send(media(old))
+    sender.send(media(new))
+    if listener.recv(64) != media(new):
+        raise RuntimeError("stale datagram reached listener")
+    print("Same-port rejoin rejected superseded session traffic.")
+
+# Keep the UDP endpoint open but stop responding after admission.
+with ExitStack() as stack:
+    silent = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+    silent.bind(("127.0.0.1", 0))
+    silent.settimeout(5)
+    address = f"127.0.0.1:{silent.getsockname()[1]}"
+    peer = launch(stack, "headset_player", address, "Waiting", "--tone-peer",
+                  seconds=30, stderr=PIPE)
+    request, endpoint = silent.recvfrom(192)
+    if not request.startswith(b"CV2 JOIN\0"):
+        raise RuntimeError("expected voice admission")
+    silent.sendto(struct.pack("!4sQ", b"CV2A", 1), endpoint)
+    _, error = peer.communicate(timeout=21)
+    if peer.returncode == 0 or "server stopped responding" not in error:
+        raise RuntimeError(f"silent server did not trigger heartbeat timeout: {error}")
+    print("Lost server detected within the heartbeat deadline.")

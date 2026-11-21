@@ -24,14 +24,16 @@ Build the release examples using the commands below. Start `target/release/examp
 
 - For a manual check, run `target/release/examples/headset_player.exe ADDRESS Ada --enable-microphone`. This activates the Windows default microphone and plays the other seat through the default output. The current device adapter requires 48 kHz float input and output. Use headphones and start with low playback volume. Type `mute`, `unmute`, `deafen`, `undeafen` or `quit` followed by Enter. A device stream error ends the session and reports the cause.
 - For a three-second generated peer, run `target/release/examples/headset_player.exe ADDRESS Lin --tone-peer`. Speak during this interval and check whether the tone peer reports received audio. Its output meter counts 20 ms blocks that cross an amplitude threshold. A human listening at both ends is still needed to judge speech quality.
-- For unattended verification, run `python crates/server/tests/media_smoke.py`. Its duplex case starts two synthetic peers and exercises the same capture framing, codec workers, queues and playback conversion used by the headset command. The server accepts another player after both exit.
+- For unattended verification, run `python crates/server/tests/media_smoke.py`. It exercises the headset capture, codec, queue and playback paths with generated audio. A listener stays connected while two successive peers join under the same name. A separate case reuses a UDP port and sends delayed audio and leave packets from the former session.
 - For per-process CPU and memory on Windows, run `./crates/server/tests/windows_resources.ps1` in PowerShell 7. The script runs two synthetic peers, samples working set and private bytes once a second for 30 seconds, and reports CPU as a percentage of one logical core. Audio drivers, a GUI and the game are outside this workload.
 
 Each client uses two bounded queues of two 20 ms frames each. An 80 ms age check discards expired frames. The loopback probe uses a shared host clock. Each client receives a single remote stream.
 
+When a peer rejoins, the listener resets its Opus decoder and discards queued or partially played audio from the previous session. Within one stream it skips duplicate and late sequence numbers. The client sends a heartbeat every five seconds and ends the session after fifteen seconds without forwarded media or a heartbeat reply.
+
 To use two different headsets on one PC, run `cargo run --release -p club-voice-client --bin club-voice-device-check -- --list-devices`. In each player's PowerShell window, set `$env:CLUB_VOICE_INPUT_ID` and `$env:CLUB_VOICE_OUTPUT_ID` to the corresponding printed IDs before starting the headset example. Omit either variable to use the Windows default for that direction.
 
-On November 20, a 30-second Windows release sample with two synthetic duplex clients reported 7.75 MiB sampled peak working set and 1.38 MiB private bytes per client. CPU averaged 3.12% and 3.38% of one logical core. The server used 5.11 MiB working set, 0.78 MiB private bytes and 0.86% of one core. Treat these as local development measurements.
+On November 20, a 30-second Windows release sample with two synthetic duplex clients using CVM2 reported 7.75 and 7.81 MiB sampled peak working set, 1.38 and 1.44 MiB private bytes, and 2.20% and 2.15% average CPU relative to one logical core. The server used 5.11 MiB working set, 0.78 MiB private bytes and 0.36% of one core. A separate run measured same-host send-to-decode p95 of 257 µs with 10 ms frames and 339 µs with 20 ms frames. Game frame time, input latency and physical mouth-to-ear delay still need hardware measurements.
 
 ## Non-negotiable constraints
 
@@ -43,7 +45,7 @@ On November 20, a 30-second Windows release sample with two synthetic duplex cli
 
 ## Next implementation sequence
 
-1. Add speaker identity before enabling multiple senders. The experimental CVM1 datagram carries frame duration, sequence, a same-host timing marker and the Opus payload.
+1. Keep the two-seat limit until each concurrent speaker has independent decoder and playback state. CVM2 carries a server-issued session ID, frame duration, sequence, a same-host timing marker and the Opus payload. A replacement peer gets a new ID even when its display name and UDP port are reused.
 2. Test bounded playout under jitter, packet loss and reordering with the same synthetic source.
 3. Run the manual headset check and document device names, formats, heard speech, mute/deafen, unplug and shutdown outcomes with the tester's permission.
 4. Connect two independent clients through the local server and collect queue, underrun, delay, CPU/RAM, and game-impact receipts.

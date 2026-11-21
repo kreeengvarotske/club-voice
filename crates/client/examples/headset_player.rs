@@ -22,6 +22,7 @@ use std::{
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const N: usize = 960;
 const MAX_AGE: Duration = Duration::from_millis(80);
+const HEARTBEAT: Duration = Duration::from_secs(5);
 type Frame = (Instant, [i16; N]);
 
 #[derive(Default)]
@@ -33,6 +34,8 @@ struct State {
     dropped_playback: AtomicU64,
     sent: AtomicU64,
     received: AtomicU64,
+    remote_stream: AtomicU64,
+    streams_heard: AtomicU64,
 }
 
 fn config(mut formats: impl Iterator<Item = SupportedStreamConfigRange>) -> Result<StreamConfig> {
@@ -67,22 +70,27 @@ fn capture(channels: usize, tx: SyncSender<Frame>, state: Arc<State>) -> impl Fn
     }
 }
 
-fn playback(channels: usize, rx: Receiver<Frame>, state: Arc<State>) -> impl FnMut(&mut [f32]) {
+fn playback(
+    channels: usize,
+    rx: Receiver<(u64, Frame)>,
+    state: Arc<State>,
+) -> impl FnMut(&mut [f32]) {
     let mut current = None;
     let mut pos = 0;
     move |samples| {
         samples.fill(0.0);
         let now = Instant::now();
+        let active = state.remote_stream.load(Relaxed);
         if state.deafened.load(Relaxed) {
             current = None;
             while rx.try_recv().is_ok() {}
             return;
         }
-        for output in samples.chunks_exact_mut(channels) {
-            while current
-                .as_ref()
-                .is_none_or(|(at, _): &Frame| now.saturating_duration_since(*at) > MAX_AGE)
-            {
+        let mut output = samples.chunks_exact_mut(channels);
+        while output.len() > 0 {
+            while current.as_ref().is_none_or(|(id, (at, _)): &(u64, Frame)| {
+                *id < active || now.saturating_duration_since(*at) > MAX_AGE
+            }) {
                 if current.take().is_some() {
                     state.dropped_playback.fetch_add(1, Relaxed);
                 }
@@ -92,8 +100,12 @@ fn playback(channels: usize, rx: Receiver<Frame>, state: Arc<State>) -> impl FnM
                     return;
                 }
             }
-            output.fill(current.as_ref().unwrap().1[pos] as f32 / 32768.0);
-            pos += 1;
+            let (_, (_, pcm)) = current.as_ref().unwrap();
+            let count = (N - pos).min(output.len());
+            for (channels_out, sample) in output.by_ref().take(count).zip(&pcm[pos..pos + count]) {
+                channels_out.fill(*sample as f32 / 32768.0);
+            }
+            pos += count;
             if pos == N {
                 current = None;
             }
@@ -101,15 +113,15 @@ fn playback(channels: usize, rx: Receiver<Frame>, state: Arc<State>) -> impl FnM
     }
 }
 
-fn transmit(socket: &UdpSocket, rx: Receiver<Frame>, state: &State) -> Result<()> {
+fn transmit(socket: &UdpSocket, rx: Receiver<Frame>, state: &State, stream: u64) -> Result<()> {
     let mut encoder = FrameEncoder::new(&Config::default())?;
     let mut payload = [0; MAX_OPUS_PACKET];
     let mut packet = [0; MAX_DATAGRAM];
     let mut seq = 0u32;
     let mut heartbeat = Instant::now();
     while state.running.load(Relaxed) {
-        if heartbeat.elapsed() > Duration::from_secs(5) {
-            socket.send(b"CV1 PING")?;
+        if heartbeat.elapsed() >= HEARTBEAT {
+            socket.send(&club_voice_protocol::media::SessionCommand::Ping.packet(stream))?;
             heartbeat = Instant::now();
         }
         match rx.recv_timeout(Duration::from_millis(50)) {
@@ -117,6 +129,7 @@ fn transmit(socket: &UdpSocket, rx: Receiver<Frame>, state: &State) -> Result<()
                 let size = encoder.encode(&pcm, &mut payload)?;
                 let sent_us = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64;
                 Header {
+                    stream,
                     frame_ms: 20,
                     sequence: seq,
                     sent_us,
@@ -137,10 +150,16 @@ fn transmit(socket: &UdpSocket, rx: Receiver<Frame>, state: &State) -> Result<()
     Ok(())
 }
 
-fn receive(socket: &UdpSocket, tx: SyncSender<Frame>, state: &State) -> Result<()> {
+fn receive(socket: &UdpSocket, tx: SyncSender<(u64, Frame)>, state: &State) -> Result<()> {
     let mut decoder = FrameDecoder::new(&Config::default())?;
     let mut packet = [0; MAX_DATAGRAM + 1];
+    let mut active = 0;
+    let mut last_sequence = 0;
+    let mut server_seen = Instant::now();
     while state.running.load(Relaxed) {
+        if server_seen.elapsed() >= HEARTBEAT * 3 {
+            return Err("voice server stopped responding; reconnect".into());
+        }
         let len = match socket.recv(&mut packet) {
             Ok(n) => n,
             Err(e)
@@ -153,12 +172,17 @@ fn receive(socket: &UdpSocket, tx: SyncSender<Frame>, state: &State) -> Result<(
             }
             Err(e) => return Err(e.into()),
         };
+        if &packet[..len] == b"PONG" {
+            server_seen = Instant::now();
+            continue;
+        }
         if &packet[..len] == b"JOIN_REQUIRED" {
             return Err("server session expired; reconnect".into());
         }
         let Some((header, payload)) = Header::parse(&packet[..len]) else {
             continue;
         };
+        server_seen = Instant::now();
         if header.frame_ms != 20 || state.deafened.load(Relaxed) {
             continue;
         }
@@ -171,17 +195,38 @@ fn receive(socket: &UdpSocket, tx: SyncSender<Frame>, state: &State) -> Result<(
             continue;
         };
         let at = Instant::now() - Duration::from_micros(age as u64);
+        if header.stream < active
+            || header.stream == 0
+            || (header.stream == active && !newer_sequence(header.sequence, last_sequence))
+        {
+            state.dropped_playback.fetch_add(1, Relaxed);
+            continue;
+        }
+        if header.stream > active {
+            decoder.reset()?;
+        }
         let mut frame = [0; N];
         if decoder.decode(Some(payload), &mut frame).is_err() {
             state.dropped_playback.fetch_add(1, Relaxed);
             continue;
         }
         state.received.fetch_add(1, Relaxed);
-        if tx.try_send((at, frame)).is_err() {
+        last_sequence = header.sequence;
+        if header.stream > active {
+            active = header.stream;
+            state.remote_stream.store(active, Relaxed);
+            state.streams_heard.fetch_add(1, Relaxed);
+        }
+        if tx.try_send((active, (at, frame))).is_err() {
             state.dropped_playback.fetch_add(1, Relaxed);
         }
     }
     Ok(())
+}
+
+fn newer_sequence(sequence: u32, previous: u32) -> bool {
+    // Forward half of the wrapping sequence space. Reject duplicates and late frames.
+    matches!(sequence.wrapping_sub(previous), 1..=0x7fff_ffff)
 }
 
 fn main() -> Result<()> {
@@ -201,18 +246,13 @@ fn main() -> Result<()> {
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
     socket.connect(address)?;
     socket.set_read_timeout(Some(Duration::from_secs(2)))?;
-    socket.send(format!("CV1 JOIN\0{name}\0test").as_bytes())?;
-    let mut reply = [0; 32];
-    let n = socket.recv(&mut reply)?;
-    if &reply[..n] != b"LOBBY" {
-        return Err("lobby admission refused".into());
-    }
+    let stream = club_voice_client::join_loopback_voice(&socket, name)?;
     let result = if consent == "--tone-peer" {
-        tone_peer(&socket)
+        tone_peer(&socket, stream)
     } else {
-        session(&socket)
+        session(&socket, stream)
     };
-    let _ = socket.send(b"CV1 LEAVE");
+    let _ = socket.send(&club_voice_protocol::media::SessionCommand::Leave.packet(stream));
     result
 }
 
@@ -247,7 +287,7 @@ fn endpoint(host: &cpal::Host, input: bool) -> Result<cpal::Device> {
     }
 }
 
-fn session(socket: &UdpSocket) -> Result<()> {
+fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
     let host = cpal::default_host();
     let input = endpoint(&host, true)?;
     let output = endpoint(&host, false)?;
@@ -301,7 +341,7 @@ fn session(socket: &UdpSocket) -> Result<()> {
     });
     let result = thread::scope(|scope| {
         scope.spawn(|| {
-            let _ = stop.try_send(transmit(socket, cap_rx, &state));
+            let _ = stop.try_send(transmit(socket, cap_rx, &state, stream));
         });
         scope.spawn(|| {
             let _ = stop.try_send(receive(socket, play_tx, &state));
@@ -323,7 +363,7 @@ fn session(socket: &UdpSocket) -> Result<()> {
 }
 
 // Runs the same PCM adapters and both network workers using generated samples.
-fn tone_peer(socket: &UdpSocket) -> Result<()> {
+fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
     let seconds = env::var("CLUB_VOICE_PROBE_SECONDS")
         .unwrap_or_else(|_| "3".to_owned())
         .parse::<u64>()?;
@@ -343,10 +383,13 @@ fn tone_peer(socket: &UdpSocket) -> Result<()> {
     println!("READY");
     let mut audible = 0;
     thread::scope(|scope| -> Result<()> {
-        let sender = scope.spawn(|| transmit(socket, cap_rx, &state));
+        let sender = scope.spawn(|| transmit(socket, cap_rx, &state, stream));
         let receiver = scope.spawn(|| receive(socket, play_tx, &state));
         let start = Instant::now();
         for i in 1..=seconds * 50 {
+            if receiver.is_finished() || sender.is_finished() {
+                break;
+            }
             record(&input);
             render(&mut output);
             if output.iter().any(|s| s.abs() > 0.02) {
@@ -362,10 +405,11 @@ fn tone_peer(socket: &UdpSocket) -> Result<()> {
         Ok(())
     })?;
     println!(
-        "sent={} decoded={} audible_blocks={}",
+        "sent={} decoded={} audible_blocks={} streams_heard={}",
         state.sent.load(Relaxed),
         state.received.load(Relaxed),
-        audible
+        audible,
+        state.streams_heard.load(Relaxed)
     );
     if audible < 50 {
         return Err("expected at least one second of received signal".into());
@@ -376,6 +420,48 @@ fn tone_peer(socket: &UdpSocket) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sequence_order_accepts_loss_and_wraparound() {
+        assert!(newer_sequence(0, u32::MAX));
+        assert!(newer_sequence(6, 3));
+        assert!(!newer_sequence(3, 3));
+        assert!(!newer_sequence(u32::MAX, 0));
+    }
+
+    #[test]
+    fn replacement_discards_partial_and_queued_audio_from_previous_peer() {
+        let state = Arc::new(State::default());
+        let (tx, rx) = mpsc::sync_channel(2);
+        let mut render = playback(1, rx, state.clone());
+        let mut sample = [0.0];
+        state.remote_stream.store(1, Relaxed);
+        tx.send((1, (Instant::now(), [16384; N]))).unwrap();
+        render(&mut sample);
+        assert_eq!(sample, [0.5]);
+        tx.send((1, (Instant::now(), [16384; N]))).unwrap();
+        state.remote_stream.store(2, Relaxed);
+        tx.send((2, (Instant::now(), [-16384; N]))).unwrap();
+        render(&mut sample);
+        assert_eq!(sample, [-0.5]);
+        assert_eq!(state.dropped_playback.load(Relaxed), 2);
+    }
+
+    #[test]
+    fn stereo_callback_spans_frames_and_pads_underrun_with_silence() {
+        let state = Arc::new(State::default());
+        let (tx, rx) = mpsc::sync_channel(2);
+        tx.send((1, (Instant::now(), [16384; N]))).unwrap();
+        tx.send((1, (Instant::now(), [-16384; N]))).unwrap();
+        let mut render = playback(2, rx, state);
+        let mut first = [0.0; 2 * (N + 3)];
+        render(&mut first);
+        assert!(first[..2 * N].iter().all(|v| *v == 0.5));
+        assert!(first[2 * N..].iter().all(|v| *v == -0.5));
+        let mut rest = [1.0; 2 * N];
+        render(&mut rest);
+        assert!(rest[..2 * (N - 3)].iter().all(|v| *v == -0.5));
+        assert!(rest[2 * (N - 3)..].iter().all(|v| *v == 0.0));
+    }
     #[test]
     fn mute_discards_partial_frame_before_resuming() {
         let state = Arc::new(State::default());
@@ -394,9 +480,9 @@ mod tests {
     fn playback_expires_old_frames_and_deafen_discards_remainder() {
         let state = Arc::new(State::default());
         let (tx, rx) = mpsc::sync_channel(2);
-        tx.send((Instant::now() - Duration::from_secs(1), [-1000; N]))
+        tx.send((0, (Instant::now() - Duration::from_secs(1), [-1000; N])))
             .unwrap();
-        tx.send((Instant::now(), [16384; N])).unwrap();
+        tx.send((0, (Instant::now(), [16384; N]))).unwrap();
         let mut render = playback(2, rx, state.clone());
         let mut pair = [0.0; 2];
         render(&mut pair);

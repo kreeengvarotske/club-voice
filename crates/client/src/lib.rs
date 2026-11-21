@@ -2,6 +2,35 @@
 
 use club_voice_protocol::BoundedQueue;
 
+/// Developer protocol for the local, two-seat media probes.
+pub fn join_loopback_voice(socket: &std::net::UdpSocket, name: &str) -> std::io::Result<u64> {
+    use std::io::{Error, ErrorKind};
+    if !socket.peer_addr()?.ip().is_loopback()
+        || name.trim().is_empty()
+        || name.len() > 48
+        || name.contains('\0')
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "expected a loopback server and a valid display name",
+        ));
+    }
+    socket.send(format!("CV2 JOIN\0{name}\0test").as_bytes())?;
+    let mut buf = [0; 32];
+    let n = socket.recv(&mut buf)?;
+    if n != 12 || &buf[..4] != b"CV2A" {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("join failed: {}", String::from_utf8_lossy(&buf[..n])),
+        ));
+    }
+    let stream = u64::from_be_bytes(buf[4..12].try_into().unwrap());
+    if stream == 0 {
+        return Err(Error::new(ErrorKind::InvalidData, "zero voice session ID"));
+    }
+    Ok(stream)
+}
+
 #[cfg(feature = "audio-device-probe")]
 pub mod devices {
     //! Device enumeration only. This module never builds an input or output

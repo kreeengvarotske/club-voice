@@ -1,6 +1,7 @@
 //! Developer control protocol over localhost UDP. Each datagram is one request.
 use crate::{AdmissionError, RoomServer, ServerConfig};
 use club_voice_protocol::JoinRequest;
+use club_voice_protocol::media::SessionCommand;
 use std::{
     collections::HashMap,
     io,
@@ -11,7 +12,14 @@ use std::{
 pub struct LocalHost {
     socket: UdpSocket,
     rooms: RoomServer,
-    peers: HashMap<SocketAddr, (String, Instant)>,
+    peers: HashMap<SocketAddr, Peer>,
+    last_stream: u64,
+}
+
+struct Peer {
+    name: String,
+    seen: Instant,
+    stream: u64,
 }
 
 impl LocalHost {
@@ -20,6 +28,7 @@ impl LocalHost {
             socket: UdpSocket::bind((Ipv4Addr::LOCALHOST, port))?,
             rooms: RoomServer::new(config),
             peers: HashMap::new(),
+            last_stream: 0,
         })
     }
 
@@ -47,49 +56,83 @@ impl LocalHost {
             other => other?,
         };
         let now = Instant::now();
-        self.peers.retain(|_, (name, seen)| {
-            let live = now.duration_since(*seen) < Duration::from_secs(30);
+        self.peers.retain(|_, peer| {
+            let live = now.duration_since(peer.seen) < Duration::from_secs(30);
             if !live {
-                self.rooms.leave_lobby(name);
+                self.rooms.leave_lobby(&peer.name);
             }
             live
         });
         let response = match &packet[..size] {
             bytes if bytes.starts_with(club_voice_protocol::media::MAGIC) => {
-                if club_voice_protocol::media::Header::parse(bytes).is_some()
-                    && let Some((_, seen)) = self.peers.get_mut(&peer)
+                if let Some((header, _)) = club_voice_protocol::media::Header::parse(bytes)
+                    && let Some(sender) = self.peers.get_mut(&peer)
+                    && sender.stream == header.stream
+                    && sender.stream != 0
                 {
-                    *seen = now;
-                    for other in self.peers.keys().filter(|other| **other != peer) {
+                    sender.seen = now;
+                    for (other, _) in self
+                        .peers
+                        .iter()
+                        .filter(|(other, p)| **other != peer && p.stream != 0)
+                    {
                         self.socket.send_to(bytes, other)?;
                     }
                 }
                 return Ok(());
             }
-            b"CV1 LEAVE" => {
-                if let Some((name, _)) = self.peers.remove(&peer) {
-                    self.rooms.leave_lobby(&name);
+            bytes if let Some((command, id)) = SessionCommand::parse(bytes) => {
+                match self.peers.get_mut(&peer) {
+                    Some(p) if p.stream == id => match command {
+                        SessionCommand::Ping => {
+                            p.seen = now;
+                            "PONG"
+                        }
+                        SessionCommand::Leave => {
+                            let p = self.peers.remove(&peer).unwrap();
+                            self.rooms.leave_lobby(&p.name);
+                            "LEFT"
+                        }
+                    },
+                    Some(_) => return Ok(()),
+                    None => "JOIN_REQUIRED",
+                }
+            }
+            b"CV1 LEAVE" if self.peers.get(&peer).is_none_or(|p| p.stream == 0) => {
+                if let Some(p) = self.peers.remove(&peer) {
+                    self.rooms.leave_lobby(&p.name);
                 }
                 "LEFT"
             }
             b"CV1 PING" => match self.peers.get_mut(&peer) {
-                Some((_, seen)) => {
-                    *seen = now;
+                Some(p) if p.stream == 0 => {
+                    p.seen = now;
                     "PONG"
                 }
-                None => "JOIN_REQUIRED",
+                _ => "JOIN_REQUIRED",
             },
-            bytes if bytes.len() <= 192 => self.join(peer, bytes, now),
+            bytes if bytes.len() <= 192 && bytes.starts_with(b"CV2 JOIN\0") => {
+                let status = self.join(peer, &bytes[9..], now, true);
+                if status == "LOBBY" {
+                    let mut ack = *b"CV2A00000000";
+                    ack[4..].copy_from_slice(&self.peers[&peer].stream.to_be_bytes());
+                    self.socket.send_to(&ack, peer)?;
+                    return Ok(());
+                }
+                status
+            }
+            bytes if bytes.len() <= 192 && bytes.starts_with(b"CV1 JOIN\0") => {
+                self.join(peer, &bytes[9..], now, false)
+            }
             _ => "INVALID",
         };
         self.socket.send_to(response.as_bytes(), peer)?;
         Ok(())
     }
 
-    fn join(&mut self, peer: SocketAddr, packet: &[u8], now: Instant) -> &'static str {
+    fn join(&mut self, peer: SocketAddr, packet: &[u8], now: Instant, media: bool) -> &'static str {
         let Some((name, password)) = std::str::from_utf8(packet)
             .ok()
-            .and_then(|s| s.strip_prefix("CV1 JOIN\0"))
             .and_then(|s| s.split_once('\0'))
         else {
             return "INVALID";
@@ -97,11 +140,11 @@ impl LocalHost {
         if password != self.rooms.config.password {
             return "DENIED";
         }
-        if let Some((existing, seen)) = self.peers.get_mut(&peer) {
-            if existing != name {
+        if let Some(existing) = self.peers.get_mut(&peer) {
+            if existing.name != name || (existing.stream != 0) != media {
                 return "LEAVE_FIRST";
             }
-            *seen = now;
+            existing.seen = now;
             return "LOBBY";
         }
         match self.rooms.admit(JoinRequest {
@@ -109,7 +152,18 @@ impl LocalHost {
             password: password.into(),
         }) {
             Ok(()) => {
-                self.peers.insert(peer, (name.into(), now));
+                self.last_stream = self
+                    .last_stream
+                    .checked_add(1)
+                    .expect("stream counter exhausted");
+                self.peers.insert(
+                    peer,
+                    Peer {
+                        name: name.into(),
+                        seen: now,
+                        stream: if media { self.last_stream } else { 0 },
+                    },
+                );
                 "LOBBY"
             }
             Err(AdmissionError::ServerFull) => "FULL",

@@ -22,7 +22,7 @@ fn clock_us() -> Result<u64> {
         .try_into()?)
 }
 
-fn send(socket: &UdpSocket, cfg: &Config) -> Result<()> {
+fn send(socket: &UdpSocket, cfg: &Config, stream: u64) -> Result<()> {
     let mut source = SyntheticSource::new(cfg)?;
     let mut encoder = FrameEncoder::new(cfg)?;
     let mut pcm = vec![0; cfg.frame_samples()];
@@ -36,6 +36,7 @@ fn send(socket: &UdpSocket, cfg: &Config) -> Result<()> {
         let size = encoder.encode(&pcm, &mut encoded)?;
         packet[HEADER..HEADER + size].copy_from_slice(&encoded[..size]);
         Header {
+            stream,
             frame_ms: cfg.frame_ms as u8,
             sequence,
             sent_us: clock_us()?,
@@ -117,19 +118,15 @@ fn main() -> Result<()> {
     socket.connect(address)?;
     socket.set_read_timeout(Some(Duration::from_secs(4)))?;
     let mut reply = [0; 32];
-    socket.send(format!("CV1 JOIN\0{role}\0test").as_bytes())?;
-    let size = socket.recv(&mut reply)?;
-    if &reply[..size] != b"LOBBY" {
-        return Err("join refused".into());
-    }
+    let stream = club_voice_client::join_loopback_voice(&socket, role)?;
     println!("READY");
     io::stdout().flush()?;
     if role == "send" {
-        send(&socket, &cfg)?;
+        send(&socket, &cfg, stream)?;
     } else {
         receive(&socket, &cfg)?;
     }
-    socket.send(b"CV1 LEAVE")?;
+    socket.send(&club_voice_protocol::media::SessionCommand::Leave.packet(stream))?;
     let size = socket.recv(&mut reply)?;
     if &reply[..size] != b"LEFT" {
         return Err("leave failed".into());
