@@ -3,8 +3,11 @@
 use club_voice_protocol::BoundedQueue;
 
 /// Developer protocol for the local, two-seat media probes.
+/// Call before starting workers that use the connected socket.
 pub fn join_loopback_voice(socket: &std::net::UdpSocket, name: &str) -> std::io::Result<u64> {
+    use club_voice_protocol::media::{Header, MAX_DATAGRAM};
     use std::io::{Error, ErrorKind};
+    use std::time::{Duration, Instant};
     if !socket.peer_addr()?.ip().is_loopback()
         || name.trim().is_empty()
         || name.len() > 48
@@ -15,20 +18,57 @@ pub fn join_loopback_voice(socket: &std::net::UdpSocket, name: &str) -> std::io:
             "expected a loopback server and a valid display name",
         ));
     }
-    socket.send(format!("CV2 JOIN\0{name}\0test").as_bytes())?;
-    let mut buf = [0; 32];
-    let n = socket.recv(&mut buf)?;
-    if n != 12 || &buf[..4] != b"CV2A" {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("join failed: {}", String::from_utf8_lossy(&buf[..n])),
-        ));
-    }
-    let stream = u64::from_be_bytes(buf[4..12].try_into().unwrap());
-    if stream == 0 {
-        return Err(Error::new(ErrorKind::InvalidData, "zero voice session ID"));
-    }
-    Ok(stream)
+    let original_timeout = socket.read_timeout()?;
+    let deadline = Instant::now() + original_timeout.unwrap_or(Duration::from_secs(2));
+    let request = format!("CV2 JOIN\0{name}\0test");
+    let mut buf = [0; MAX_DATAGRAM + 1];
+    let result = (|| {
+        for attempts_left in (1..=3).rev() {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let attempt_deadline = now + deadline.duration_since(now) / attempts_left;
+            socket.send(request.as_bytes())?;
+            loop {
+                let wait = attempt_deadline.saturating_duration_since(Instant::now());
+                if wait.is_zero() {
+                    break;
+                }
+                socket.set_read_timeout(Some(wait.max(Duration::from_millis(1))))?;
+                let n = match socket.recv(&mut buf) {
+                    Ok(n) => n,
+                    Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                        break;
+                    }
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                };
+                // The relay can forward audio before a retransmitted acknowledgement.
+                if Header::parse(&buf[..n]).is_some() {
+                    continue;
+                }
+                if n != 12 || &buf[..4] != b"CV2A" {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("join failed: {}", String::from_utf8_lossy(&buf[..n])),
+                    ));
+                }
+                let stream = u64::from_be_bytes(buf[4..12].try_into().unwrap());
+                return if stream == 0 {
+                    Err(Error::new(ErrorKind::InvalidData, "zero voice session ID"))
+                } else {
+                    Ok(stream)
+                };
+            }
+        }
+        Err(Error::new(
+            ErrorKind::TimedOut,
+            "voice server did not acknowledge admission",
+        ))
+    })();
+    let restored = socket.set_read_timeout(original_timeout);
+    result.and_then(|stream| restored.map(|()| stream))
 }
 
 #[cfg(feature = "audio-device-probe")]
@@ -155,6 +195,50 @@ pub fn build_sdk_runtime() -> shared_runtime::Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_retries_within_the_timeout_and_ignores_early_audio() {
+        use club_voice_protocol::media::{HEADER, Header, MAX_DATAGRAM};
+        use std::{
+            net::{Ipv4Addr, UdpSocket},
+            thread,
+            time::Duration,
+        };
+
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        client.connect(server.local_addr().unwrap()).unwrap();
+        let timeout = Some(Duration::from_millis(750));
+        client.set_read_timeout(timeout).unwrap();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut request = [0; 64];
+                let (n, peer) = server.recv_from(&mut request).unwrap();
+                assert_eq!(&request[..n], b"CV2 JOIN\0Player\0test");
+                // Drop the first acknowledgement and send audio before the second.
+                let mut early = [0; MAX_DATAGRAM];
+                Header {
+                    stream: 9,
+                    frame_ms: 20,
+                    sequence: 0,
+                    sent_us: 0,
+                }
+                .write(&mut early);
+                server.send_to(&early[..HEADER + 1], peer).unwrap();
+                let (n, again) = server.recv_from(&mut request).unwrap();
+                assert_eq!(again, peer);
+                assert_eq!(&request[..n], b"CV2 JOIN\0Player\0test");
+                let mut ack = *b"CV2A00000000";
+                ack[4..].copy_from_slice(&7u64.to_be_bytes());
+                server.send_to(&ack, peer).unwrap();
+            });
+            assert_eq!(join_loopback_voice(&client, "Player").unwrap(), 7);
+            assert_eq!(client.read_timeout().unwrap(), timeout);
+        });
+    }
 
     #[test]
     fn does_not_request_capture_by_default() {

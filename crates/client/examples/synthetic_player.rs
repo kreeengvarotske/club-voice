@@ -46,7 +46,19 @@ fn send(socket: &UdpSocket, cfg: &Config, stream: u64) -> Result<()> {
     Ok(())
 }
 
-fn receive(socket: &UdpSocket, cfg: &Config) -> Result<()> {
+fn recv_probe_packet(socket: &UdpSocket, buffer: &mut [u8], stream: u64) -> Result<usize> {
+    let mut acknowledgement = *b"CV2A00000000";
+    acknowledgement[4..].copy_from_slice(&stream.to_be_bytes());
+    for _ in 0..3 {
+        let size = socket.recv(buffer)?;
+        if buffer[..size] != acknowledgement {
+            return Ok(size);
+        }
+    }
+    Err("too many duplicate admission replies".into())
+}
+
+fn receive(socket: &UdpSocket, cfg: &Config, stream: u64) -> Result<()> {
     let mut decoder = FrameDecoder::new(cfg)?;
     let mut packet = [0; MAX_DATAGRAM + 1];
     let mut frame = vec![0; cfg.frame_samples()];
@@ -55,7 +67,7 @@ fn receive(socket: &UdpSocket, cfg: &Config) -> Result<()> {
     let mut delays = Vec::with_capacity(count as usize);
     let mut total_bytes = 0;
     for expected in 0..count {
-        let size = socket.recv(&mut packet)?;
+        let size = recv_probe_packet(socket, &mut packet, stream)?;
         let (header, payload) = Header::parse(&packet[..size]).ok_or("invalid relay packet")?;
         if header.sequence != expected || u32::from(header.frame_ms) != cfg.frame_ms {
             return Err(format!("unexpected frame {header:?}, expected {expected}").into());
@@ -123,10 +135,10 @@ fn main() -> Result<()> {
     if role == "send" {
         send(&socket, &cfg, stream)?;
     } else {
-        receive(&socket, &cfg)?;
+        receive(&socket, &cfg, stream)?;
     }
     socket.send(&club_voice_protocol::media::SessionCommand::Leave.packet(stream))?;
-    let size = socket.recv(&mut reply)?;
+    let size = recv_probe_packet(&socket, &mut reply, stream)?;
     if &reply[..size] != b"LEFT" {
         return Err("leave failed".into());
     }
