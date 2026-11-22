@@ -59,12 +59,13 @@ function Measure-Duplex([int]$Run) {
             $p = $owned[$i]
             if (-not $p.WaitForExit(10000) -or $p.ExitCode -ne 0) { throw "Duplex probe failed" }
             $summary = $p.StandardOutput.ReadToEnd().Trim()
-            if ($summary -notmatch '(?m)^rendered_real_frames=(\d+) send_to_render_p95_ms=(\d+)\r?$') {
+            if ($summary -notmatch '(?m)^rendered_real_frames=(\d+) send_to_render_p95_ms=(\d+)(?: send_to_receive_p95_ms=(\d+))?\r?$') {
                 throw "Playback latency is missing from the probe output. Rebuild the release examples."
             }
             $report[$i] | Add-Member -NotePropertyMembers @{
                 RenderedRealFrames = [int]$Matches[1]
                 SendToRenderP95Ms = [int]$Matches[2]
+                SendToReceiveP95Ms = if ($Matches.ContainsKey(3)) { [int]$Matches[3] } else { $null }
             }
             if ($summary -notmatch '(?m)^sent=(\d+) decoded=(\d+) [^\r\n]*\bprobe_missed_ticks=(\d+) plc_rendered_samples=(\d+) playback_queue_full=(\d+) underrun_samples=(\d+)\r?$') {
                 throw "Packet and playback counters are missing from the probe output. Rebuild the release examples."

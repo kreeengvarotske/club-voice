@@ -242,7 +242,17 @@ fn receive(
     socket: &UdpSocket,
     tx: SyncSender<PlaybackBatch>,
     state: &State,
+    probe_drop_sequence: Option<u32>,
+) -> Result<()> {
+    receive_with_observer(socket, tx, state, probe_drop_sequence, |_| {})
+}
+
+fn receive_with_observer(
+    socket: &UdpSocket,
+    tx: SyncSender<PlaybackBatch>,
+    state: &State,
     mut probe_drop_sequence: Option<u32>,
+    mut on_received_frame: impl FnMut(Duration),
 ) -> Result<()> {
     let mut decoder = FrameDecoder::new(&Config::default())?;
     let mut packet = [0; MAX_DATAGRAM + 1];
@@ -293,7 +303,8 @@ fn receive(
             state.dropped_playback.fetch_add(1, Relaxed);
             continue;
         };
-        let at = Instant::now() - Duration::from_micros(age as u64);
+        let age = Duration::from_micros(age as u64);
+        let at = Instant::now() - age;
         if header.stream == 0 {
             state.dropped_playback.fetch_add(1, Relaxed);
             continue;
@@ -340,6 +351,7 @@ fn receive(
             }
             state.dropped_playback.fetch_add(1, Relaxed);
         }
+        on_received_frame(age);
         state.received.fetch_add(1, Relaxed);
         last_sequence = header.sequence;
     }
@@ -511,6 +523,33 @@ fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
 
 const PROBE_PERIOD: Duration = Duration::from_millis(20);
 
+struct ProbeLatency([u32; MAX_AGE.as_millis() as usize + 1]);
+
+impl ProbeLatency {
+    fn new() -> Self {
+        Self([0; MAX_AGE.as_millis() as usize + 1])
+    }
+
+    fn record(&mut self, age: Duration) {
+        let bucket = age.as_nanos().div_ceil(1_000_000) as usize;
+        self.0[bucket] += 1;
+    }
+
+    fn p95(&self) -> Option<(u32, usize)> {
+        let frames: u32 = self.0.iter().sum();
+        if frames == 0 {
+            return None;
+        }
+        let rank = (frames * 95).div_ceil(100);
+        let mut cumulative = 0;
+        let bucket = self.0.iter().position(|count| {
+            cumulative += count;
+            cumulative >= rank
+        })?;
+        Some((frames, bucket))
+    }
+}
+
 fn next_probe_tick(due: Instant, now: Instant) -> (Instant, u64) {
     let missed = now.saturating_duration_since(due).as_millis() / PROBE_PERIOD.as_millis();
     if missed > 0 {
@@ -536,10 +575,10 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
     let (cap_tx, cap_rx) = mpsc::sync_channel(2);
     let (play_tx, play_rx) = mpsc::sync_channel(PLAYBACK_BATCHES);
     let mut record = capture(1, cap_tx, state.clone());
-    let mut ages = [0u32; MAX_AGE.as_millis() as usize + 1];
+    let mut received_ages = ProbeLatency::new();
+    let mut rendered_ages = ProbeLatency::new();
     let mut render = playback_with_observer(2, play_rx, state.clone(), |age| {
-        let bucket = age.as_nanos().div_ceil(1_000_000) as usize;
-        ages[bucket] += 1;
+        rendered_ages.record(age);
     });
     let input: [f32; N] =
         std::array::from_fn(|i| (std::f32::consts::TAU * 500.0 * i as f32 / 48000.0).sin() * 0.15);
@@ -551,7 +590,11 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
     let mut probe_missed_ticks = 0;
     thread::scope(|scope| -> Result<()> {
         let sender = scope.spawn(|| transmit(socket, cap_rx, &state, stream));
-        let receiver = scope.spawn(|| receive(socket, play_tx, &state, probe_drop_sequence));
+        let receiver = scope.spawn(|| {
+            receive_with_observer(socket, play_tx, &state, probe_drop_sequence, |age| {
+                received_ages.record(age);
+            })
+        });
         let mut due = Instant::now();
         let end = due + Duration::from_secs(seconds);
         loop {
@@ -593,18 +636,10 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
         return Err("expected at least one second of received signal".into());
     }
     drop(render);
-    let frames: u32 = ages.iter().sum();
-    if frames == 0 {
-        return Err("no real frames rendered".into());
-    }
-    let mut cumulative = 0;
-    let p95 = ages.iter().position(|count| {
-        cumulative += count;
-        cumulative >= (frames * 95).div_ceil(100)
-    });
+    let (_, receive_p95) = received_ages.p95().ok_or("no real frames received")?;
+    let (frames, render_p95) = rendered_ages.p95().ok_or("no real frames rendered")?;
     println!(
-        "rendered_real_frames={frames} send_to_render_p95_ms={}",
-        p95.unwrap()
+        "rendered_real_frames={frames} send_to_render_p95_ms={render_p95} send_to_receive_p95_ms={receive_p95}"
     );
     Ok(())
 }
@@ -613,6 +648,17 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
 mod tests {
     use super::*;
     use opus_roundtrip_spike::MAX_OPUS_PACKET;
+
+    #[test]
+    fn probe_latency_rounds_up_and_uses_the_nearest_rank() {
+        let mut latency = ProbeLatency::new();
+        assert_eq!(latency.p95(), None);
+        for _ in 0..19 {
+            latency.record(Duration::from_micros(1));
+        }
+        latency.record(MAX_AGE);
+        assert_eq!(latency.p95(), Some((20, 1)));
+    }
     #[test]
     fn idle_sender_heartbeats_and_stops_when_capture_closes() {
         let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
