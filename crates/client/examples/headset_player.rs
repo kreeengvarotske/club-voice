@@ -54,6 +54,7 @@ struct State {
     deafened: AtomicBool,
     dropped_capture: AtomicU64,
     dropped_playback: AtomicU64,
+    underrun_samples: AtomicU64,
     concealed: AtomicU64,
     sent: AtomicU64,
     received: AtomicU64,
@@ -127,6 +128,10 @@ fn playback(
                 });
                 pos = 0;
                 if current.is_none() {
+                    // Count mono sample periods, independent of output channel count.
+                    state
+                        .underrun_samples
+                        .fetch_add(output.len() as u64, Relaxed);
                     return;
                 }
             }
@@ -434,11 +439,12 @@ fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
     drop(microphone);
     drop(headphones);
     println!(
-        "sent={} decoded={} capture_drops={} playback_drops={}",
+        "sent={} decoded={} capture_drops={} playback_drops={} underrun_samples={}",
         state.sent.load(Relaxed),
         state.received.load(Relaxed),
         state.dropped_capture.load(Relaxed),
-        state.dropped_playback.load(Relaxed)
+        state.dropped_playback.load(Relaxed),
+        state.underrun_samples.load(Relaxed)
     );
     result
 }
@@ -490,12 +496,13 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
         Ok(())
     })?;
     println!(
-        "sent={} decoded={} concealed={} audible_blocks={} streams_heard={}",
+        "sent={} decoded={} concealed={} audible_blocks={} streams_heard={} underrun_samples={}",
         state.sent.load(Relaxed),
         state.received.load(Relaxed),
         state.concealed.load(Relaxed),
         audible,
-        state.streams_heard.load(Relaxed)
+        state.streams_heard.load(Relaxed),
+        state.underrun_samples.load(Relaxed)
     );
     if audible < 50 {
         return Err("expected at least one second of received signal".into());
@@ -613,7 +620,7 @@ mod tests {
             .unwrap();
         tx.send(PlaybackBatch::one(1, (Instant::now(), [-16384; N])))
             .unwrap();
-        let mut render = playback(2, rx, state);
+        let mut render = playback(2, rx, state.clone());
         let mut first = [0.0; 2 * (N + 3)];
         render(&mut first);
         assert!(first[..2 * N].iter().all(|v| *v == 0.5));
@@ -622,6 +629,10 @@ mod tests {
         render(&mut rest);
         assert!(rest[..2 * (N - 3)].iter().all(|v| *v == -0.5));
         assert!(rest[2 * (N - 3)..].iter().all(|v| *v == 0.0));
+        assert_eq!(state.underrun_samples.load(Relaxed), 3);
+        state.deafened.store(true, Relaxed);
+        render(&mut rest);
+        assert_eq!(state.underrun_samples.load(Relaxed), 3);
     }
     #[test]
     fn mute_discards_partial_frame_before_resuming() {
