@@ -11,10 +11,13 @@ from subprocess import PIPE, Popen
 from threading import Thread
 
 
-def launch(stack, name, args, lines):
+def launch(stack, name, args, lines, *, seconds=None):
     root = Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "release/examples"
     executable = root / (name + (".exe" if os.name == "nt" else ""))
-    child = Popen([executable, *args], stdin=PIPE, stdout=PIPE, stderr=PIPE, text=True)
+    env = dict(os.environ)
+    if seconds is not None:
+        env["CLUB_VOICE_PROBE_SECONDS"] = str(seconds)
+    child = Popen([executable, *args], stdin=PIPE, stdout=PIPE, stderr=PIPE, text=True, env=env)
     stack.callback(child.wait, timeout=5)
     stack.callback(child.kill)
     child.stdin.write("\n".join(lines) + "\n")
@@ -28,7 +31,7 @@ def read_ready(child):
     return line.get(timeout=5).strip()
 
 
-def run(ip):
+def run(ip, check_client):
     password = "lan-smoke-only"
     with ExitStack() as stack:
         relay = launch(stack, "local_control", ["--lan"], [f"{ip}:0", password])
@@ -50,6 +53,22 @@ def run(ip):
             if client.returncode or "arrival_to_render_p95_ms=" not in report:
                 raise RuntimeError(f"LAN duplex failed: {report}\n{error}")
             print(report.strip())
+        if check_client:
+            companion = launch(
+                stack, "headset_player", args, [address, "Companion", password], seconds=12
+            )
+            if not read_ready(companion).endswith("READY"):
+                raise RuntimeError("test companion did not join")
+            check = launch(
+                stack, "headset_player", ["--check-lan"], [address, password], seconds=3
+            )
+            report, error = check.communicate(timeout=12)
+            if check.returncode or "PASS: LAN check complete" not in report:
+                raise RuntimeError(f"combined LAN check failed: {report}\n{error}")
+            companion_report, error = companion.communicate(timeout=10)
+            if companion.returncode or "streams_heard=2 " not in companion_report:
+                raise RuntimeError(f"companion did not hear both sessions: {companion_report}\n{error}")
+            print("Combined LAN check:", report.strip())
 
     # Echo real Opus from a second session with deliberately incompatible wall clocks.
     with ExitStack() as stack:
@@ -81,4 +100,6 @@ def run(ip):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("ip", type=ipaddress.IPv4Address, help="private IPv4 on this machine")
-    run(parser.parse_args().ip)
+    parser.add_argument("--check-client", action="store_true", help="also exercise the combined device and network check")
+    args = parser.parse_args()
+    run(args.ip, args.check_client)

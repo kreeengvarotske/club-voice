@@ -8,7 +8,13 @@ Extract the same ZIP on both PCs and connect them to the same trusted local netw
 2. Double-click `Host-LAN.cmd`. Find the IPv4 address of the active Ethernet or Wi-Fi adapter in the printed list. Enter that address followed by `:40771`, for example `192.168.1.42:40771`.
 3. Enter a temporary room password of at least eight characters. Keep the server window open. If Windows prompts for network access, use the private network profile only.
 
-## Join on both PCs
+## Run the automatic check
+
+1. On PC 1, start the server and double-click `Play-Test-Tone.cmd`. Enter the server address, a display name and the room password. This peer runs for two minutes.
+2. On PC 2, connect the headset and double-click `Check-LAN.cmd`. Enter the server address and password once. The check reports device formats, rejects a wrong password, runs two synthetic voice sessions and verifies leave acknowledgements and a new session ID.
+3. Check for `PASS: LAN check complete` on PC 2. The test peer on PC 1 prints its received audio summary when it finishes. Both commands use generated audio and keep audio devices closed.
+
+## Join on both PCs for a live call
 
 1. Connect and select the headset on PC 2 as well. `Check-Devices.cmd` checks format support without starting capture. `List-Devices.cmd` lists devices through the shared-runtime diagnostic.
 2. Double-click `Join-LAN.cmd` on each PC. Enter the same server address and password and use different display names. Enter `y` to enable the microphone.

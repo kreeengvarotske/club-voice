@@ -21,12 +21,15 @@ function Write-Launcher([string]$Name, [string[]]$Commands) {
 
 Write-Launcher 'Host-LAN.cmd' @('ipconfig', '"%~dp0local_control.exe" --lan')
 Write-Launcher 'Join-LAN.cmd' @('"%~dp0headset_player.exe" --join-lan')
+Write-Launcher 'Play-Test-Tone.cmd' @('set CLUB_VOICE_PROBE_SECONDS=120', '"%~dp0headset_player.exe" --join-lan --tone-peer')
+Write-Launcher 'Check-LAN.cmd' @('set CLUB_VOICE_PROBE_SECONDS=3', '"%~dp0headset_player.exe" --check-lan')
 Write-Launcher 'Check-Devices.cmd' @('"%~dp0headset_player.exe" --check-devices')
 Write-Launcher 'List-Devices.cmd' @('"%~dp0club-voice-device-check.exe" --list-devices')
 
 $files = @(
     'local_control.exe', 'headset_player.exe', 'club-voice-device-check.exe', 'README.txt',
-    'Host-LAN.cmd', 'Join-LAN.cmd', 'Check-Devices.cmd', 'List-Devices.cmd'
+    'Host-LAN.cmd', 'Join-LAN.cmd', 'Play-Test-Tone.cmd', 'Check-LAN.cmd',
+    'Check-Devices.cmd', 'List-Devices.cmd'
 ) | ForEach-Object { Join-Path $bundle $_ }
 $zip = "$bundle.zip"
 Compress-Archive -LiteralPath $files -DestinationPath $zip -Force

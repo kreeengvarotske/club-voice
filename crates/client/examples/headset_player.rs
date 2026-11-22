@@ -408,6 +408,9 @@ fn main() -> Result<()> {
     if args == ["--check-devices"] {
         return check_devices();
     }
+    if args == ["--check-lan"] {
+        return check_lan();
+    }
     if args == ["--join-lan"] || args == ["--join-lan", "--tone-peer"] {
         return join_lan(args.len() == 2);
     }
@@ -446,19 +449,29 @@ fn prompt(label: &str) -> io::Result<String> {
     Ok(answer.trim().to_owned())
 }
 
-fn join_lan(tone: bool) -> Result<()> {
+fn prompt_lan_address() -> Result<SocketAddrV4> {
     let address: SocketAddrV4 = prompt("Server address (IPv4:port)")?.parse()?;
     if !address.ip().is_private() {
         return Err("enter a private IPv4 server address".into());
     }
+    Ok(address)
+}
+
+fn connect_lan(address: SocketAddrV4) -> io::Result<UdpSocket> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    socket.connect(address)?;
+    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+    Ok(socket)
+}
+
+fn join_lan(tone: bool) -> Result<()> {
+    let address = prompt_lan_address()?;
     let name = prompt("Display name")?;
     let password = prompt("Room password")?;
     if !tone && !prompt("Enable microphone? [y/N]")?.eq_ignore_ascii_case("y") {
         return Ok(());
     }
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    socket.connect(address)?;
-    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let socket = connect_lan(address)?;
     let stream = club_voice_client::join_lan_voice(&socket, &name, &password)?;
     let result = if tone {
         tone_peer(&socket, stream)
@@ -467,6 +480,72 @@ fn join_lan(tone: bool) -> Result<()> {
     };
     let _ = socket.send(&club_voice_protocol::media::SessionCommand::Leave.packet(stream));
     result
+}
+
+fn check_lan() -> Result<()> {
+    let address = prompt_lan_address()?;
+    let password = prompt("Room password")?;
+    let devices = check_devices();
+    match &devices {
+        Ok(()) => println!("PASS: device formats"),
+        Err(e) => eprintln!("FAIL: device formats: {e}"),
+    }
+
+    let socket = connect_lan(address)?;
+    let wrong_password = if password == "invalid-check-password" {
+        "another-invalid-password"
+    } else {
+        "invalid-check-password"
+    };
+    match club_voice_client::join_lan_voice(&socket, "LAN check", wrong_password) {
+        Err(e) if e.to_string() == "join failed: DENIED" => {
+            println!("PASS: wrong password rejected")
+        }
+        Err(e) => return Err(format!("password rejection check failed: {e}").into()),
+        Ok(stream) => {
+            let _ = socket.send(&club_voice_protocol::media::SessionCommand::Leave.packet(stream));
+            return Err("server accepted a wrong password".into());
+        }
+    }
+
+    let mut previous = None;
+    for step in ["initial connection", "rejoin"] {
+        let stream = club_voice_client::join_lan_voice(&socket, "LAN check", &password)?;
+        if previous == Some(stream) {
+            return Err("rejoin did not start a new voice session".into());
+        }
+        let audio = tone_peer(&socket, stream);
+        let left = leave_lan_confirmed(&socket, stream);
+        audio?;
+        left?;
+        println!("PASS: {step}, synthetic audio received and leave acknowledged");
+        previous = Some(stream);
+    }
+    devices?;
+    println!("PASS: LAN check complete");
+    Ok(())
+}
+
+fn leave_lan_confirmed(socket: &UdpSocket, stream: u64) -> Result<()> {
+    socket.send(&club_voice_protocol::media::SessionCommand::Leave.packet(stream))?;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut packet = [0; MAX_DATAGRAM + 1];
+    while Instant::now() < deadline {
+        match socket.recv(&mut packet) {
+            Ok(size) if &packet[..size] == b"LEFT" => {
+                socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err("server did not confirm departure".into())
 }
 
 fn endpoint(host: &cpal::Host, input: bool) -> Result<cpal::Device> {
