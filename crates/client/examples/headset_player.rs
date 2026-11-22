@@ -486,6 +486,17 @@ fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
     result
 }
 
+const PROBE_PERIOD: Duration = Duration::from_millis(20);
+
+fn next_probe_tick(due: Instant, now: Instant) -> (Instant, u64) {
+    let missed = now.saturating_duration_since(due).as_millis() / PROBE_PERIOD.as_millis();
+    if missed > 0 {
+        (now + PROBE_PERIOD, missed as u64)
+    } else {
+        (due + PROBE_PERIOD, 0)
+    }
+}
+
 // Runs the same PCM adapters and both network workers using generated samples.
 fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
     let seconds = env::var("CLUB_VOICE_PROBE_SECONDS")
@@ -514,22 +525,29 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
     state.running.store(true, Relaxed);
     println!("READY");
     let mut audible = 0;
+    let mut probe_missed_ticks = 0;
     thread::scope(|scope| -> Result<()> {
         let sender = scope.spawn(|| transmit(socket, cap_rx, &state, stream));
         let receiver = scope.spawn(|| receive(socket, play_tx, &state, probe_drop_sequence));
-        let start = Instant::now();
-        for i in 1..=seconds * 50 {
-            if receiver.is_finished() || sender.is_finished() {
+        let mut due = Instant::now();
+        let end = due + Duration::from_secs(seconds);
+        loop {
+            let now = Instant::now();
+            if now >= end || receiver.is_finished() || sender.is_finished() {
                 break;
             }
+            if now < due {
+                thread::sleep(due.min(end).duration_since(now));
+                continue;
+            }
+            let (next, missed) = next_probe_tick(due, now);
+            due = next;
+            probe_missed_ticks += missed;
             record(&input);
             render(&mut output);
             if output.iter().any(|s| s.abs() > 0.02) {
                 audible += 1;
             }
-            thread::sleep(
-                (start + Duration::from_millis(i * 20)).saturating_duration_since(Instant::now()),
-            );
         }
         state.running.store(false, Relaxed);
         sender.join().expect("sender panicked")?;
@@ -537,7 +555,7 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
         Ok(())
     })?;
     println!(
-        "sent={} decoded={} concealed={} audible_blocks={} streams_heard={} plc_rendered_samples={} playback_queue_full={} underrun_samples={}",
+        "sent={} decoded={} concealed={} audible_blocks={} streams_heard={} probe_missed_ticks={probe_missed_ticks} plc_rendered_samples={} playback_queue_full={} underrun_samples={}",
         state.sent.load(Relaxed),
         state.received.load(Relaxed),
         state.concealed.load(Relaxed),
@@ -570,6 +588,15 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn probe_skips_elapsed_ticks_after_a_scheduler_stall() {
+        let due = Instant::now();
+        let slightly_late = due + Duration::from_millis(3);
+        assert_eq!(next_probe_tick(due, slightly_late), (due + PROBE_PERIOD, 0));
+        let stalled = due + Duration::from_millis(65);
+        assert_eq!(next_probe_tick(due, stalled), (stalled + PROBE_PERIOD, 3));
+    }
+
     #[test]
     fn sequence_distance_accepts_loss_and_wraparound() {
         assert_eq!(forward_distance(0, u32::MAX), Some(1));
