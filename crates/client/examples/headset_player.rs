@@ -58,6 +58,7 @@ struct State {
     playback_queue_full: AtomicU64,
     underrun_samples: AtomicU64,
     concealed: AtomicU64,
+    plc_rendered_samples: AtomicU64,
     sent: AtomicU64,
     received: AtomicU64,
     remote_stream: AtomicU64,
@@ -164,6 +165,9 @@ fn playback_with_observer(
                 on_real_frame(now.saturating_duration_since(*at));
             }
             let count = (N - pos).min(output.len());
+            if pending.is_some() {
+                state.plc_rendered_samples.fetch_add(count as u64, Relaxed);
+            }
             for (channels_out, sample) in output.by_ref().take(count).zip(&pcm[pos..pos + count]) {
                 channels_out.fill(*sample as f32 / 32768.0);
             }
@@ -469,11 +473,13 @@ fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
     drop(microphone);
     drop(headphones);
     println!(
-        "sent={} decoded={} capture_drops={} playback_drops={} playback_queue_full={} underrun_samples={}",
+        "sent={} decoded={} capture_drops={} playback_drops={} concealed={} plc_rendered_samples={} playback_queue_full={} underrun_samples={}",
         state.sent.load(Relaxed),
         state.received.load(Relaxed),
         state.dropped_capture.load(Relaxed),
         state.dropped_playback.load(Relaxed),
+        state.concealed.load(Relaxed),
+        state.plc_rendered_samples.load(Relaxed),
         state.playback_queue_full.load(Relaxed),
         state.underrun_samples.load(Relaxed)
     );
@@ -531,12 +537,13 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
         Ok(())
     })?;
     println!(
-        "sent={} decoded={} concealed={} audible_blocks={} streams_heard={} playback_queue_full={} underrun_samples={}",
+        "sent={} decoded={} concealed={} audible_blocks={} streams_heard={} plc_rendered_samples={} playback_queue_full={} underrun_samples={}",
         state.sent.load(Relaxed),
         state.received.load(Relaxed),
         state.concealed.load(Relaxed),
         audible,
         state.streams_heard.load(Relaxed),
+        state.plc_rendered_samples.load(Relaxed),
         state.playback_queue_full.load(Relaxed),
         state.underrun_samples.load(Relaxed)
     );
@@ -671,6 +678,10 @@ mod tests {
                     .all(|sample| *sample == 0.5)
             );
             assert_eq!(state.underrun_samples.load(Relaxed), silence as u64);
+            assert_eq!(
+                state.plc_rendered_samples.load(Relaxed),
+                (N - silence) as u64
+            );
         }
     }
 
