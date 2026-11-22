@@ -78,4 +78,3 @@ Counts are totals over all seeds. 'Silent' includes frames before the first and 
 | mixed: loss 2%, jitter 0-20 ms, dup 1% | immediate, PLC<=6, age<=80ms | 0 ms | 86.34% | 13.66% | 0.00% | 0 ms | 601 | 52 | 0 | 0 | -0.27 dB |
 | mixed: loss 2%, jitter 0-20 ms, dup 1% | window 20ms, PLC<=6 | 20 ms | 98.16% | 1.84% | 0.00% | 0 ms | 0 | 62 | 0 | 0 | -0.11 dB |
 | mixed: loss 2%, jitter 0-20 ms, dup 1% | window 40ms, PLC<=6 | 40 ms | 98.16% | 1.84% | 0.00% | 0 ms | 0 | 62 | 0 | 0 | -0.11 dB |
-

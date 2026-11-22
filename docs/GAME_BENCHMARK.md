@@ -60,13 +60,26 @@ PresentMon --process_name GAME.exe --output_file results/run-N-frames.csv --time
 
 (Flag names may differ between PresentMon versions; record the exact command used.)
 
-After the run, summarize the capture:
+After the run, summarize the capture. `--process` is required whenever the capture holds more than one process (PresentMon usually also records `dwm.exe` and overlays). If one executable name has several process IDs, add `--pid`:
 
 ```powershell
 python tools/game-benchmark/summarize_frametimes.py results/run-N-frames.csv --process GAME.exe
 ```
 
-Copy the printed `frames seconds avg_fps p95_ms p99_ms` and, for voice_on, the per-process CPU and memory rows and the client counters into `tools/game-benchmark/results-template.csv` (save a copy as `results/game-benchmark.csv`).
+It prints `process pid frames seconds avg_fps p95_ms p99_ms` for that process only. If the selection is ambiguous or the capture is empty, it exits with code 2 and lists the candidate processes instead of guessing.
+
+Copy the printed values and, for voice_on, the per-process CPU and memory rows and the client counters into `tools/game-benchmark/results-template.csv` (save a copy as `results/game-benchmark.csv`).
+
+After all six runs, produce the paired report (run order matters: consecutive runs form the off/on pairs):
+
+```powershell
+python tools/game-benchmark/summarize_frametimes.py --process GAME.exe `
+  voice_off=results/run-1-frames.csv voice_on=results/run-2-frames.csv `
+  voice_on=results/run-3-frames.csv voice_off=results/run-4-frames.csv `
+  voice_off=results/run-5-frames.csv voice_on=results/run-6-frames.csv
+```
+
+It prints a per-run table, the mean ± standard deviation per condition and the voice_on minus voice_off difference for each pair. `tools/game-benchmark/README.md` shows a worked example on test captures.
 
 ## Input latency
 
