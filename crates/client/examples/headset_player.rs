@@ -116,18 +116,20 @@ fn playback_with_observer(
     let mut pos = 0;
     let mut silent_samples = 0;
     move |samples| {
-        samples.fill(0.0);
         let now = Instant::now();
         let active = state.remote_stream.load(Relaxed);
         if state.deafened.load(Relaxed) {
+            samples.fill(0.0);
             current = None;
             pending = None;
             silent_samples = 0;
             while rx.try_recv().is_ok() {}
             return;
         }
-        let mut output = samples.chunks_exact_mut(channels);
-        while output.len() > 0 {
+        let aligned_len = samples.len() - samples.len() % channels;
+        let (mut output, remainder) = samples.split_at_mut(aligned_len);
+        remainder.fill(0.0);
+        while !output.is_empty() {
             while current.as_ref().is_none_or(|(id, (at, _)): &(u64, Frame)| {
                 *id < active || now.saturating_duration_since(*at) > MAX_AGE
             }) {
@@ -143,10 +145,10 @@ fn playback_with_observer(
                 pos = 0;
                 if current.is_none() {
                     // Count mono sample periods, independent of output channel count.
-                    silent_samples = (silent_samples + output.len().min(N)).min(N);
-                    state
-                        .underrun_samples
-                        .fetch_add(output.len() as u64, Relaxed);
+                    let missing = output.len() / channels;
+                    silent_samples = (silent_samples + missing.min(N)).min(N);
+                    state.underrun_samples.fetch_add(missing as u64, Relaxed);
+                    output.fill(0.0);
                     return;
                 }
             }
@@ -164,13 +166,17 @@ fn playback_with_observer(
             if pos == 0 && pending.is_none() {
                 on_real_frame(now.saturating_duration_since(*at));
             }
-            let count = (N - pos).min(output.len());
+            let count = (N - pos).min(output.len() / channels);
             if pending.is_some() {
                 state.plc_rendered_samples.fetch_add(count as u64, Relaxed);
             }
-            for (channels_out, sample) in output.by_ref().take(count).zip(&pcm[pos..pos + count]) {
+            let (block, rest) = output.split_at_mut(count * channels);
+            for (channels_out, sample) in
+                block.chunks_exact_mut(channels).zip(&pcm[pos..pos + count])
+            {
                 channels_out.fill(*sample as f32 / 32768.0);
             }
+            output = rest;
             pos += count;
             if pos == N {
                 current = None;
@@ -776,10 +782,11 @@ mod tests {
         tx.try_send(PlaybackBatch::one(1, (Instant::now(), [-16384; N])))
             .unwrap();
         let mut render = playback(2, rx, state.clone());
-        let mut first = [0.0; 2 * (N + 3)];
+        let mut first = [1.0; 2 * (N + 3) + 1];
         render(&mut first);
         assert!(first[..2 * N].iter().all(|v| *v == 0.5));
-        assert!(first[2 * N..].iter().all(|v| *v == -0.5));
+        assert!(first[2 * N..2 * (N + 3)].iter().all(|v| *v == -0.5));
+        assert_eq!(first[2 * (N + 3)], 0.0);
         let mut rest = [1.0; 2 * N];
         render(&mut rest);
         assert!(rest[..2 * (N - 3)].iter().all(|v| *v == -0.5));
