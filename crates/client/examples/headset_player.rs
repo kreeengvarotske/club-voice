@@ -23,6 +23,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const N: usize = 960;
 const MAX_AGE: Duration = Duration::from_millis(80);
 const HEARTBEAT: Duration = Duration::from_secs(5);
+const PLAYBACK_BATCHES: usize = 2;
 type Frame = (Instant, [i16; N]);
 type PlaybackFrame = (u64, Frame);
 
@@ -54,6 +55,7 @@ struct State {
     deafened: AtomicBool,
     dropped_capture: AtomicU64,
     dropped_playback: AtomicU64,
+    playback_queue_full: AtomicU64,
     underrun_samples: AtomicU64,
     concealed: AtomicU64,
     sent: AtomicU64,
@@ -294,7 +296,10 @@ fn receive(
         } else {
             PlaybackBatch::one(header.stream, (at, frame))
         };
-        if tx.try_send(batch).is_err() {
+        if let Err(error) = tx.try_send(batch) {
+            if matches!(error, mpsc::TrySendError::Full(_)) {
+                state.playback_queue_full.fetch_add(1, Relaxed);
+            }
             state.dropped_playback.fetch_add(1, Relaxed);
         }
         state.received.fetch_add(1, Relaxed);
@@ -394,7 +399,7 @@ fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
     let o = config(output.supported_output_configs()?)?;
     let state = Arc::new(State::default());
     let (cap_tx, cap_rx) = mpsc::sync_channel(2);
-    let (play_tx, play_rx) = mpsc::sync_channel(1);
+    let (play_tx, play_rx) = mpsc::sync_channel(PLAYBACK_BATCHES);
     let (stop, done) = mpsc::sync_channel::<Result<()>>(1);
     let on_error = || {
         let stop = stop.clone();
@@ -452,11 +457,12 @@ fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
     drop(microphone);
     drop(headphones);
     println!(
-        "sent={} decoded={} capture_drops={} playback_drops={} underrun_samples={}",
+        "sent={} decoded={} capture_drops={} playback_drops={} playback_queue_full={} underrun_samples={}",
         state.sent.load(Relaxed),
         state.received.load(Relaxed),
         state.dropped_capture.load(Relaxed),
         state.dropped_playback.load(Relaxed),
+        state.playback_queue_full.load(Relaxed),
         state.underrun_samples.load(Relaxed)
     );
     result
@@ -476,7 +482,7 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
         .map(|value| value.parse::<u32>())
         .transpose()?;
     let (cap_tx, cap_rx) = mpsc::sync_channel(2);
-    let (play_tx, play_rx) = mpsc::sync_channel(1);
+    let (play_tx, play_rx) = mpsc::sync_channel(PLAYBACK_BATCHES);
     let mut record = capture(1, cap_tx, state.clone());
     let mut ages = [0u32; MAX_AGE.as_millis() as usize + 1];
     let mut render = playback_with_observer(2, play_rx, state.clone(), |age| {
@@ -513,12 +519,13 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
         Ok(())
     })?;
     println!(
-        "sent={} decoded={} concealed={} audible_blocks={} streams_heard={} underrun_samples={}",
+        "sent={} decoded={} concealed={} audible_blocks={} streams_heard={} playback_queue_full={} underrun_samples={}",
         state.sent.load(Relaxed),
         state.received.load(Relaxed),
         state.concealed.load(Relaxed),
         audible,
         state.streams_heard.load(Relaxed),
+        state.playback_queue_full.load(Relaxed),
         state.underrun_samples.load(Relaxed)
     );
     if audible < 50 {
@@ -651,10 +658,10 @@ mod tests {
     #[test]
     fn stereo_callback_spans_frames_and_pads_underrun_with_silence() {
         let state = Arc::new(State::default());
-        let (tx, rx) = mpsc::sync_channel(2);
-        tx.send(PlaybackBatch::one(1, (Instant::now(), [16384; N])))
+        let (tx, rx) = mpsc::sync_channel(PLAYBACK_BATCHES);
+        tx.try_send(PlaybackBatch::one(1, (Instant::now(), [16384; N])))
             .unwrap();
-        tx.send(PlaybackBatch::one(1, (Instant::now(), [-16384; N])))
+        tx.try_send(PlaybackBatch::one(1, (Instant::now(), [-16384; N])))
             .unwrap();
         let mut render = playback(2, rx, state.clone());
         let mut first = [0.0; 2 * (N + 3)];

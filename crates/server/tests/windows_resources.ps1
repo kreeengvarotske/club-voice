@@ -66,13 +66,14 @@ function Measure-Duplex([int]$Run) {
                 RenderedRealFrames = [int]$Matches[1]
                 SendToRenderP95Ms = [int]$Matches[2]
             }
-            if ($summary -notmatch '(?m)^sent=(\d+) decoded=(\d+) [^\r\n]*\bunderrun_samples=(\d+)\r?$') {
-                throw "Packet and underrun counts are missing from the probe output."
+            if ($summary -notmatch '(?m)^sent=(\d+) decoded=(\d+) [^\r\n]*\bplayback_queue_full=(\d+) underrun_samples=(\d+)\r?$') {
+                throw "Packet and playback counters are missing from the probe output. Rebuild the release examples."
             }
             $report[$i] | Add-Member -NotePropertyMembers @{
                 SentFrames = [int]$Matches[1]
                 DecodedFrames = [int]$Matches[2]
-                UnderrunSamples = [int]$Matches[3]
+                PlaybackQueueFull = [int]$Matches[3]
+                UnderrunSamples = [int]$Matches[4]
             }
             Write-Host $summary
         }
