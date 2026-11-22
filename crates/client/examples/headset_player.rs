@@ -1,10 +1,10 @@
 //! Developer-only, two-seat loopback headset probe. Input/output at 48 kHz.
-use club_voice_protocol::media::{HEADER, Header, MAX_DATAGRAM};
+use club_voice_protocol::media::{HEADER, Header, MAX_DATAGRAM, MAX_PAYLOAD};
 use cpal::{
     SampleFormat, StreamConfig, SupportedStreamConfigRange,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use opus_roundtrip_spike::{Config, FrameDecoder, FrameEncoder, MAX_OPUS_PACKET};
+use opus_roundtrip_spike::{Config, FrameDecoder, FrameEncoder};
 use std::{
     env,
     error::Error,
@@ -199,7 +199,6 @@ fn playback_with_observer(
 
 fn transmit(socket: &UdpSocket, rx: Receiver<Frame>, state: &State, stream: u64) -> Result<()> {
     let mut encoder = FrameEncoder::new(&Config::default())?;
-    let mut payload = [0; MAX_OPUS_PACKET];
     let mut packet = [0; MAX_DATAGRAM];
     let mut seq = 0u32;
     let mut heartbeat = Instant::now();
@@ -215,7 +214,8 @@ fn transmit(socket: &UdpSocket, rx: Receiver<Frame>, state: &State, stream: u64)
         match rx.recv_timeout(wait) {
             Ok(_) if !state.running.load(Relaxed) => break,
             Ok((at, pcm)) if at.elapsed() <= MAX_AGE && !state.muted.load(Relaxed) => {
-                let size = encoder.encode(&pcm, &mut payload)?;
+                let payload = packet.last_chunk_mut::<MAX_PAYLOAD>().unwrap();
+                let size = encoder.encode(&pcm, payload)?;
                 let sent_us = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64;
                 Header {
                     stream,
@@ -224,7 +224,6 @@ fn transmit(socket: &UdpSocket, rx: Receiver<Frame>, state: &State, stream: u64)
                     sent_us,
                 }
                 .write(&mut packet);
-                packet[HEADER..HEADER + size].copy_from_slice(&payload[..size]);
                 socket.send(&packet[..HEADER + size])?;
                 seq = seq.wrapping_add(1);
                 state.sent.fetch_add(1, Relaxed);
@@ -613,6 +612,7 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opus_roundtrip_spike::MAX_OPUS_PACKET;
     #[test]
     fn idle_sender_heartbeats_and_stops_when_capture_closes() {
         let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

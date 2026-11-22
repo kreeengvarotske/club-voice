@@ -1,7 +1,7 @@
 //! One endpoint of the two-process synthetic Opus probe.
-use club_voice_protocol::media::{HEADER, Header, MAX_DATAGRAM};
+use club_voice_protocol::media::{HEADER, Header, MAX_DATAGRAM, MAX_PAYLOAD};
 use opus_roundtrip_spike::{
-    Config, FrameDecoder, FrameEncoder, MAX_OPUS_PACKET, SyntheticSource, TONES_HZ, goertzel_power,
+    Config, FrameDecoder, FrameEncoder, SyntheticSource, TONES_HZ, goertzel_power,
 };
 use std::{
     env,
@@ -27,14 +27,13 @@ fn send(socket: &UdpSocket, cfg: &Config, stream: u64) -> Result<()> {
     let mut encoder = FrameEncoder::new(cfg)?;
     let mut pcm = vec![0; cfg.frame_samples()];
     let mut packet = [0; MAX_DATAGRAM];
-    let mut encoded = [0; MAX_OPUS_PACKET];
     let start = Instant::now();
     for sequence in 0..RUN_MS / cfg.frame_ms {
         let due = start + Duration::from_millis(u64::from(sequence * cfg.frame_ms));
         thread::sleep(due.saturating_duration_since(Instant::now()));
         source.next_frame(&mut pcm);
-        let size = encoder.encode(&pcm, &mut encoded)?;
-        packet[HEADER..HEADER + size].copy_from_slice(&encoded[..size]);
+        let payload = packet.last_chunk_mut::<MAX_PAYLOAD>().unwrap();
+        let size = encoder.encode(&pcm, payload)?;
         Header {
             stream,
             frame_ms: cfg.frame_ms as u8,
