@@ -1,7 +1,8 @@
 //! Developer-only, two-seat loopback headset probe. Input/output at 48 kHz.
 use club_voice_protocol::media::{HEADER, Header, MAX_DATAGRAM, MAX_PAYLOAD};
 use cpal::{
-    SampleFormat, StreamConfig, SupportedStreamConfigRange,
+    FromSample, Sample, SampleFormat, SizedSample, StreamConfig, SupportedStreamConfig,
+    SupportedStreamConfigRange,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use opus_roundtrip_spike::{Config, FrameDecoder, FrameEncoder};
@@ -65,18 +66,26 @@ struct State {
     streams_heard: AtomicU64,
 }
 
-fn config(mut formats: impl Iterator<Item = SupportedStreamConfigRange>) -> Result<StreamConfig> {
-    Ok(formats
-        .find_map(|f| {
-            (f.sample_format() == SampleFormat::F32 && f.channels() > 0)
-                .then(|| f.try_with_sample_rate(48000))
-                .flatten()
+fn config(
+    formats: impl Iterator<Item = SupportedStreamConfigRange>,
+) -> Result<SupportedStreamConfig> {
+    formats
+        .filter(|f| {
+            f.channels() > 0
+                && matches!(
+                    f.sample_format(),
+                    SampleFormat::F32 | SampleFormat::I16 | SampleFormat::U16
+                )
         })
-        .ok_or("device needs a 48 kHz f32 shared-mode format")?
-        .config())
+        .filter_map(|f| f.try_with_sample_rate(48_000))
+        .min_by_key(|f| f.sample_format() != SampleFormat::F32)
+        .ok_or_else(|| "device needs a 48 kHz f32, i16 or u16 shared-mode format".into())
 }
 
-fn capture(channels: usize, tx: SyncSender<Frame>, state: Arc<State>) -> impl FnMut(&[f32]) {
+fn capture<T: Sample>(channels: usize, tx: SyncSender<Frame>, state: Arc<State>) -> impl FnMut(&[T])
+where
+    f32: FromSample<T>,
+{
     let mut frame = [0; N];
     let mut pos = 0;
     move |mut samples| {
@@ -90,11 +99,15 @@ fn capture(channels: usize, tx: SyncSender<Frame>, state: Arc<State>) -> impl Fn
             let output = &mut frame[pos..pos + count];
             if channels == 1 {
                 for (target, sample) in output.iter_mut().zip(block) {
-                    *target = (*sample * 32767.0) as i16;
+                    *target = (sample.to_sample::<f32>() * 32767.0) as i16;
                 }
             } else {
                 for (target, sample) in output.iter_mut().zip(block.chunks_exact(channels)) {
-                    *target = (sample.iter().sum::<f32>() / channels as f32 * 32767.0) as i16;
+                    let mono = sample
+                        .iter()
+                        .map(|sample| sample.to_sample::<f32>())
+                        .sum::<f32>();
+                    *target = (mono / channels as f32 * 32767.0) as i16;
                 }
             }
             pos += count;
@@ -109,20 +122,20 @@ fn capture(channels: usize, tx: SyncSender<Frame>, state: Arc<State>) -> impl Fn
     }
 }
 
-fn playback(
+fn playback<T: Sample + FromSample<i16>>(
     channels: usize,
     rx: Receiver<PlaybackBatch>,
     state: Arc<State>,
-) -> impl FnMut(&mut [f32]) {
+) -> impl FnMut(&mut [T]) {
     playback_with_observer(channels, rx, state, |_| {})
 }
 
-fn playback_with_observer(
+fn playback_with_observer<T: Sample + FromSample<i16>>(
     channels: usize,
     rx: Receiver<PlaybackBatch>,
     state: Arc<State>,
     mut on_real_frame: impl FnMut(Duration),
-) -> impl FnMut(&mut [f32]) {
+) -> impl FnMut(&mut [T]) {
     let mut current = None;
     let mut pending = None;
     let mut pos = 0;
@@ -131,7 +144,7 @@ fn playback_with_observer(
         let now = Instant::now();
         let active = state.remote_stream.load(Relaxed);
         if state.deafened.load(Relaxed) {
-            samples.fill(0.0);
+            samples.fill(T::EQUILIBRIUM);
             current = None;
             pending = None;
             silent_samples = 0;
@@ -140,7 +153,7 @@ fn playback_with_observer(
         }
         let aligned_len = samples.len() - samples.len() % channels;
         let (mut output, remainder) = samples.split_at_mut(aligned_len);
-        remainder.fill(0.0);
+        remainder.fill(T::EQUILIBRIUM);
         while !output.is_empty() {
             while current.as_ref().is_none_or(|(id, (at, _)): &(u64, Frame)| {
                 *id < active || now.saturating_duration_since(*at) > MAX_AGE
@@ -160,7 +173,7 @@ fn playback_with_observer(
                     let missing = output.len() / channels;
                     silent_samples = (silent_samples + missing.min(N)).min(N);
                     state.underrun_samples.fetch_add(missing as u64, Relaxed);
-                    output.fill(0.0);
+                    output.fill(T::EQUILIBRIUM);
                     return;
                 }
             }
@@ -186,7 +199,7 @@ fn playback_with_observer(
             for (channels_out, sample) in
                 block.chunks_exact_mut(channels).zip(&pcm[pos..pos + count])
             {
-                channels_out.fill(*sample as f32 / 32768.0);
+                channels_out.fill(T::from_sample(*sample));
             }
             output = rest;
             pos += count;
@@ -385,8 +398,11 @@ fn decode_after_gap(
 
 fn main() -> Result<()> {
     let args: Vec<_> = env::args().skip(1).collect();
+    if args == ["--check-devices"] {
+        return check_devices();
+    }
     let [address, name, consent] = args.as_slice() else {
-        return Err("Usage: headset_player 127.0.0.1:PORT NAME --enable-microphone".into());
+        return Err("Usage: headset_player --check-devices or headset_player 127.0.0.1:PORT NAME --enable-microphone".into());
     };
     let address: SocketAddrV4 = address.parse()?;
     if !address.ip().is_loopback()
@@ -441,6 +457,61 @@ fn endpoint(host: &cpal::Host, input: bool) -> Result<cpal::Device> {
     }
 }
 
+fn check_devices() -> Result<()> {
+    let host = cpal::default_host();
+    for (label, input) in [("Input", true), ("Output", false)] {
+        let device = endpoint(&host, input)?;
+        let selected = if input {
+            config(device.supported_input_configs()?)
+        } else {
+            config(device.supported_output_configs()?)
+        }
+        .map_err(|error| format!("{label} {device}: {error}"))?;
+        println!(
+            "{label}: {device}, {} Hz, {} channel(s), {:?}",
+            selected.sample_rate(),
+            selected.channels(),
+            selected.sample_format()
+        );
+    }
+    Ok(())
+}
+
+fn build_capture<T: SizedSample + 'static>(
+    device: &cpal::Device,
+    config: StreamConfig,
+    tx: SyncSender<Frame>,
+    state: Arc<State>,
+    on_error: impl FnMut(cpal::Error) + Send + 'static,
+) -> Result<cpal::Stream>
+where
+    f32: FromSample<T>,
+{
+    let mut record = capture::<T>(config.channels.into(), tx, state);
+    Ok(device.build_input_stream(
+        config,
+        move |samples, _| record(samples),
+        on_error,
+        Some(Duration::from_secs(2)),
+    )?)
+}
+
+fn build_playback<T: SizedSample + FromSample<i16> + 'static>(
+    device: &cpal::Device,
+    config: StreamConfig,
+    rx: Receiver<PlaybackBatch>,
+    state: Arc<State>,
+    on_error: impl FnMut(cpal::Error) + Send + 'static,
+) -> Result<cpal::Stream> {
+    let mut render = playback::<T>(config.channels.into(), rx, state);
+    Ok(device.build_output_stream(
+        config,
+        move |samples, _| render(samples),
+        on_error,
+        Some(Duration::from_secs(2)),
+    )?)
+}
+
 fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
     let host = cpal::default_host();
     let input = endpoint(&host, true)?;
@@ -457,20 +528,30 @@ fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
             let _ = stop.try_send(Err(e.into()));
         }
     };
-    let mut record = capture(i.channels.into(), cap_tx, state.clone());
-    let mut render = playback(o.channels.into(), play_rx, state.clone());
-    let microphone = input.build_input_stream(
-        i,
-        move |samples, _| record(samples),
-        on_error(),
-        Some(Duration::from_secs(2)),
-    )?;
-    let headphones = output.build_output_stream(
-        o,
-        move |samples, _| render(samples),
-        on_error(),
-        Some(Duration::from_secs(2)),
-    )?;
+    let microphone = match i.sample_format() {
+        SampleFormat::F32 => {
+            build_capture::<f32>(&input, i.config(), cap_tx, state.clone(), on_error())
+        }
+        SampleFormat::I16 => {
+            build_capture::<i16>(&input, i.config(), cap_tx, state.clone(), on_error())
+        }
+        SampleFormat::U16 => {
+            build_capture::<u16>(&input, i.config(), cap_tx, state.clone(), on_error())
+        }
+        _ => return Err("unsupported capture sample format".into()),
+    }?;
+    let headphones = match o.sample_format() {
+        SampleFormat::F32 => {
+            build_playback::<f32>(&output, o.config(), play_rx, state.clone(), on_error())
+        }
+        SampleFormat::I16 => {
+            build_playback::<i16>(&output, o.config(), play_rx, state.clone(), on_error())
+        }
+        SampleFormat::U16 => {
+            build_playback::<u16>(&output, o.config(), play_rx, state.clone(), on_error())
+        }
+        _ => return Err("unsupported playback sample format".into()),
+    }?;
     socket.set_read_timeout(Some(Duration::from_millis(100)))?;
     headphones.play()?;
     microphone.play()?;
@@ -582,7 +663,7 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
     });
     let input: [f32; N] =
         std::array::from_fn(|i| (std::f32::consts::TAU * 500.0 * i as f32 / 48000.0).sin() * 0.15);
-    let mut output = [0.0; N * 2];
+    let mut output = [0.0f32; N * 2];
     socket.set_read_timeout(Some(Duration::from_millis(100)))?;
     state.running.store(true, Relaxed);
     println!("READY");
@@ -648,6 +729,57 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
 mod tests {
     use super::*;
     use opus_roundtrip_spike::MAX_OPUS_PACKET;
+
+    #[test]
+    fn selects_integer_fallback_at_48_khz_and_prefers_float() {
+        let format = |rate, sample_format| {
+            SupportedStreamConfigRange::new(
+                2,
+                rate,
+                rate,
+                cpal::SupportedBufferSize::Unknown,
+                sample_format,
+            )
+        };
+        let integer = format(48_000, SampleFormat::I16);
+        let float_44 = format(44_100, SampleFormat::F32);
+        assert_eq!(
+            config([float_44, integer].into_iter())
+                .unwrap()
+                .sample_format(),
+            SampleFormat::I16
+        );
+        let float_48 = format(48_000, SampleFormat::F32);
+        assert_eq!(
+            config([integer, float_48].into_iter())
+                .unwrap()
+                .sample_format(),
+            SampleFormat::F32
+        );
+        assert!(config([float_44].into_iter()).is_err());
+    }
+
+    #[test]
+    fn integer_callbacks_convert_pcm_and_emit_unsigned_silence() {
+        let state = Arc::new(State::default());
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut record = capture::<i16>(2, tx, state.clone());
+        let stereo: [i16; 2 * N] = std::array::from_fn(|i| if i % 2 == 0 { 16384 } else { 0 });
+        record(&stereo);
+        let frame = rx.try_recv().unwrap();
+        assert!(frame.1.iter().all(|&sample| sample == 8191));
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.try_send(PlaybackBatch::one(1, frame)).unwrap();
+        let mut render = playback::<u16>(2, rx, state.clone());
+        let mut out = [0; 2 * N + 3];
+        render(&mut out);
+        assert!(out[..2 * N].iter().all(|&sample| sample == 40959));
+        assert_eq!(out[2 * N..], [32768; 3]);
+        state.deafened.store(true, Relaxed);
+        render(&mut out);
+        assert!(out.iter().all(|&sample| sample == 32768));
+    }
 
     #[test]
     fn probe_latency_rounds_up_and_uses_the_nearest_rank() {
