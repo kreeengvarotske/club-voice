@@ -79,14 +79,26 @@ fn config(mut formats: impl Iterator<Item = SupportedStreamConfigRange>) -> Resu
 fn capture(channels: usize, tx: SyncSender<Frame>, state: Arc<State>) -> impl FnMut(&[f32]) {
     let mut frame = [0; N];
     let mut pos = 0;
-    move |samples| {
+    move |mut samples| {
         if state.muted.load(Relaxed) {
             pos = 0;
             return;
         }
-        for sample in samples.chunks_exact(channels) {
-            frame[pos] = (sample.iter().sum::<f32>() / channels as f32 * 32767.0) as i16;
-            pos += 1;
+        while samples.len() >= channels {
+            let count = (N - pos).min(samples.len() / channels);
+            let (block, remaining) = samples.split_at(count * channels);
+            let output = &mut frame[pos..pos + count];
+            if channels == 1 {
+                for (target, sample) in output.iter_mut().zip(block) {
+                    *target = (*sample * 32767.0) as i16;
+                }
+            } else {
+                for (target, sample) in output.iter_mut().zip(block.chunks_exact(channels)) {
+                    *target = (sample.iter().sum::<f32>() / channels as f32 * 32767.0) as i16;
+                }
+            }
+            pos += count;
+            samples = remaining;
             if pos == N {
                 if tx.try_send((Instant::now(), frame)).is_err() {
                     state.dropped_capture.fetch_add(1, Relaxed);
@@ -796,6 +808,21 @@ mod tests {
         render(&mut rest);
         assert_eq!(state.underrun_samples.load(Relaxed), 3);
     }
+    #[test]
+    fn mono_capture_preserves_frames_across_callback_boundaries() {
+        let state = Arc::new(State::default());
+        let (tx, rx) = mpsc::sync_channel(2);
+        let mut record = capture(1, tx, state);
+        record(&[0.5; N / 2]);
+        assert!(rx.try_recv().is_err());
+        record(&[-0.5; N + N / 2]);
+        let (_, first) = rx.try_recv().unwrap();
+        let (_, second) = rx.try_recv().unwrap();
+        assert!(first[..N / 2].iter().all(|&sample| sample == 16383));
+        assert!(first[N / 2..].iter().all(|&sample| sample == -16383));
+        assert!(second.iter().all(|&sample| sample == -16383));
+    }
+
     #[test]
     fn mute_discards_partial_frame_before_resuming() {
         let state = Arc::new(State::default());
