@@ -9,7 +9,7 @@ use opus_roundtrip_spike::{Config, FrameDecoder, FrameEncoder};
 use std::{
     env,
     error::Error,
-    io,
+    io::{self, Write},
     net::{Ipv4Addr, SocketAddrV4, UdpSocket},
     sync::{
         Arc,
@@ -268,6 +268,7 @@ fn receive_with_observer(
     mut on_received_frame: impl FnMut(Duration),
 ) -> Result<()> {
     let mut decoder = FrameDecoder::new(&Config::default())?;
+    let same_host_clock = socket.peer_addr()?.ip().is_loopback();
     let mut packet = [0; MAX_DATAGRAM + 1];
     let mut frame = [0; N];
     let mut concealed = [0; N];
@@ -308,16 +309,20 @@ fn receive_with_observer(
             probe_drop_sequence = None;
             continue;
         }
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros();
-        let Some(age) = now
-            .checked_sub(header.sent_us.into())
-            .filter(|age| *age <= MAX_AGE.as_micros())
-        else {
-            state.dropped_playback.fetch_add(1, Relaxed);
-            continue;
+        let age = if same_host_clock {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros();
+            let Some(age) = now
+                .checked_sub(header.sent_us.into())
+                .filter(|age| *age <= MAX_AGE.as_micros())
+            else {
+                state.dropped_playback.fetch_add(1, Relaxed);
+                continue;
+            };
+            Some(Duration::from_micros(age as u64))
+        } else {
+            None
         };
-        let age = Duration::from_micros(age as u64);
-        let at = Instant::now() - age;
+        let at = Instant::now() - age.unwrap_or_default();
         if header.stream == 0 {
             state.dropped_playback.fetch_add(1, Relaxed);
             continue;
@@ -364,7 +369,9 @@ fn receive_with_observer(
             }
             state.dropped_playback.fetch_add(1, Relaxed);
         }
-        on_received_frame(age);
+        if let Some(age) = age {
+            on_received_frame(age);
+        }
         state.received.fetch_add(1, Relaxed);
         last_sequence = header.sequence;
     }
@@ -401,6 +408,9 @@ fn main() -> Result<()> {
     if args == ["--check-devices"] {
         return check_devices();
     }
+    if args == ["--join-lan"] || args == ["--join-lan", "--tone-peer"] {
+        return join_lan(args.len() == 2);
+    }
     let [address, name, consent] = args.as_slice() else {
         return Err("Usage: headset_player --check-devices or headset_player 127.0.0.1:PORT NAME --enable-microphone".into());
     };
@@ -418,6 +428,39 @@ fn main() -> Result<()> {
     socket.set_read_timeout(Some(Duration::from_secs(2)))?;
     let stream = club_voice_client::join_loopback_voice(&socket, name)?;
     let result = if consent == "--tone-peer" {
+        tone_peer(&socket, stream)
+    } else {
+        session(&socket, stream)
+    };
+    let _ = socket.send(&club_voice_protocol::media::SessionCommand::Leave.packet(stream));
+    result
+}
+
+fn prompt(label: &str) -> io::Result<String> {
+    print!("{label}: ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer)? == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "input closed"));
+    }
+    Ok(answer.trim().to_owned())
+}
+
+fn join_lan(tone: bool) -> Result<()> {
+    let address: SocketAddrV4 = prompt("Server address (IPv4:port)")?.parse()?;
+    if !address.ip().is_private() {
+        return Err("enter a private IPv4 server address".into());
+    }
+    let name = prompt("Display name")?;
+    let password = prompt("Room password")?;
+    if !tone && !prompt("Enable microphone? [y/N]")?.eq_ignore_ascii_case("y") {
+        return Ok(());
+    }
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    socket.connect(address)?;
+    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let stream = club_voice_client::join_lan_voice(&socket, &name, &password)?;
+    let result = if tone {
         tone_peer(&socket, stream)
     } else {
         session(&socket, stream)
@@ -717,8 +760,12 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
         return Err("expected at least one second of received signal".into());
     }
     drop(render);
-    let (_, receive_p95) = received_ages.p95().ok_or("no real frames received")?;
     let (frames, render_p95) = rendered_ages.p95().ok_or("no real frames rendered")?;
+    if !socket.peer_addr()?.ip().is_loopback() {
+        println!("rendered_real_frames={frames} arrival_to_render_p95_ms={render_p95}");
+        return Ok(());
+    }
+    let (_, receive_p95) = received_ages.p95().ok_or("no real frames received")?;
     println!(
         "rendered_real_frames={frames} send_to_render_p95_ms={render_p95} send_to_receive_p95_ms={receive_p95}"
     );

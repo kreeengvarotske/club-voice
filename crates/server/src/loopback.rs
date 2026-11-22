@@ -1,11 +1,11 @@
-//! Developer control protocol over localhost UDP. Each datagram is one request.
+//! Developer UDP relay for loopback and an explicitly selected private IPv4 interface.
 use crate::{AdmissionError, RoomServer, ServerConfig};
 use club_voice_protocol::JoinRequest;
 use club_voice_protocol::media::SessionCommand;
 use std::{
     collections::HashMap,
     io,
-    net::{Ipv4Addr, SocketAddr, UdpSocket},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
     time::{Duration, Instant},
 };
 
@@ -27,8 +27,25 @@ struct Peer {
 
 impl LocalHost {
     pub fn bind(port: u16, config: ServerConfig) -> io::Result<Self> {
+        Self::bind_address(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), config)
+    }
+
+    pub fn bind_lan(address: SocketAddrV4, config: ServerConfig) -> io::Result<Self> {
+        if !address.ip().is_private()
+            || !(8..=128).contains(&config.password.len())
+            || config.password.contains('\0')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "LAN pilot needs a private IPv4 address and an 8–128 byte room password",
+            ));
+        }
+        Self::bind_address(address, config)
+    }
+
+    fn bind_address(address: SocketAddrV4, config: ServerConfig) -> io::Result<Self> {
         Ok(Self {
-            socket: UdpSocket::bind((Ipv4Addr::LOCALHOST, port))?,
+            socket: UdpSocket::bind(address)?,
             rooms: RoomServer::new(config),
             peers: HashMap::new(),
             last_stream: 0,
@@ -59,6 +76,9 @@ impl LocalHost {
             Err(e) if cfg!(windows) && e.kind() == io::ErrorKind::ConnectionReset => return Ok(()),
             other => other?,
         };
+        if !matches!(peer.ip(), std::net::IpAddr::V4(ip) if ip.is_loopback() || ip.is_private()) {
+            return Ok(());
+        }
         let now = Instant::now();
         self.expire_peers(now);
         let response = match &packet[..size] {
@@ -192,6 +212,24 @@ impl LocalHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lan_listener_rejects_wildcard_addresses_and_short_passwords() {
+        for (ip, password) in [
+            (Ipv4Addr::UNSPECIFIED, "test-password"),
+            (Ipv4Addr::new(192, 168, 1, 2), "short"),
+        ] {
+            let result = LocalHost::bind_lan(
+                SocketAddrV4::new(ip, 0),
+                ServerConfig {
+                    name: "Test".into(),
+                    password: password.into(),
+                    member_limit: 2,
+                },
+            );
+            assert!(matches!(result, Err(e) if e.kind() == io::ErrorKind::InvalidInput));
+        }
+    }
 
     #[test]
     fn expiry_releases_capacity_and_preserves_refreshed_sessions() {

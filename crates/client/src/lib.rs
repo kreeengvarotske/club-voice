@@ -5,22 +5,48 @@ use club_voice_protocol::BoundedQueue;
 /// Developer protocol for the local, two-seat media probes.
 /// Call before starting workers that use the connected socket.
 pub fn join_loopback_voice(socket: &std::net::UdpSocket, name: &str) -> std::io::Result<u64> {
+    if !socket.peer_addr()?.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "expected a loopback server",
+        ));
+    }
+    join_voice(socket, name, "test")
+}
+
+/// Join an explicitly addressed private IPv4 pilot server before starting media workers.
+pub fn join_lan_voice(
+    socket: &std::net::UdpSocket,
+    name: &str,
+    password: &str,
+) -> std::io::Result<u64> {
+    if !matches!(socket.peer_addr()?.ip(), std::net::IpAddr::V4(ip) if ip.is_private()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "expected a private IPv4 server",
+        ));
+    }
+    join_voice(socket, name, password)
+}
+
+fn join_voice(socket: &std::net::UdpSocket, name: &str, password: &str) -> std::io::Result<u64> {
     use club_voice_protocol::media::{Header, MAX_DATAGRAM};
     use std::io::{Error, ErrorKind};
     use std::time::{Duration, Instant};
-    if !socket.peer_addr()?.ip().is_loopback()
-        || name.trim().is_empty()
+    if name.trim().is_empty()
         || name.len() > 48
         || name.contains('\0')
+        || password.len() > 128
+        || password.contains('\0')
     {
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            "expected a loopback server and a valid display name",
+            "invalid display name or room password",
         ));
     }
     let original_timeout = socket.read_timeout()?;
     let deadline = Instant::now() + original_timeout.unwrap_or(Duration::from_secs(2));
-    let request = format!("CV2 JOIN\0{name}\0test");
+    let request = format!("CV2 JOIN\0{name}\0{password}");
     let mut buf = [0; MAX_DATAGRAM + 1];
     let result = (|| {
         for attempts_left in (1..=3).rev() {

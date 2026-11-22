@@ -20,6 +20,8 @@ Physical headset acceptance, rooms with more than two participants, PTT, jitter 
 
 ## Two-seat headset check on Windows
 
+The [Windows LAN pilot](LAN_PILOT.md) adds direct private IPv4 joining for a two-PC hardware check. Build its ZIP using `./tools/package_lan_pilot.ps1`. The localhost commands below still provide the same-host timing baseline.
+
 Build the release examples using the commands below. Start `target/release/examples/local_control.exe` and copy the printed loopback address. Each client takes one seat.
 
 - Run `target/release/examples/headset_player.exe --check-devices` to check the selected input and output formats without joining a server or opening an audio stream. The probe accepts 48 kHz F32, I16 and U16 endpoints and prefers F32 when available.
