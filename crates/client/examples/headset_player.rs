@@ -113,6 +113,7 @@ fn playback_with_observer(
     let mut current = None;
     let mut pending = None;
     let mut pos = 0;
+    let mut silent_samples = 0;
     move |samples| {
         samples.fill(0.0);
         let now = Instant::now();
@@ -120,6 +121,7 @@ fn playback_with_observer(
         if state.deafened.load(Relaxed) {
             current = None;
             pending = None;
+            silent_samples = 0;
             while rx.try_recv().is_ok() {}
             return;
         }
@@ -140,12 +142,22 @@ fn playback_with_observer(
                 pos = 0;
                 if current.is_none() {
                     // Count mono sample periods, independent of output channel count.
+                    silent_samples = (silent_samples + output.len().min(N)).min(N);
                     state
                         .underrun_samples
                         .fetch_add(output.len() as u64, Relaxed);
                     return;
                 }
             }
+            if pos == 0 && pending.is_some() {
+                // Those output periods already passed as silence during the gap.
+                pos = std::mem::take(&mut silent_samples);
+                if pos == N {
+                    current = None;
+                    continue;
+                }
+            }
+            silent_samples = 0;
             let (_, (at, pcm)) = current.as_ref().unwrap();
             // A pending second frame marks the first one as synthetic PLC.
             if pos == 0 && pending.is_none() {
@@ -632,6 +644,34 @@ mod tests {
             panic!("recovery batch unexpectedly disconnected");
         };
         assert!(batch.second.is_some());
+    }
+
+    #[test]
+    fn concealment_only_fills_the_part_of_the_gap_not_already_rendered() {
+        for silence in [N / 2, N] {
+            let state = Arc::new(State::default());
+            let (tx, rx) = mpsc::sync_channel(PLAYBACK_BATCHES);
+            let mut render = playback(1, rx, state.clone());
+            let mut gap = [1.0; N];
+            render(&mut gap[..silence]);
+            assert!(gap[..silence].iter().all(|sample| *sample == 0.0));
+
+            tx.try_send(PlaybackBatch::recovered(
+                1,
+                (Instant::now(), [8192; N]),
+                (Instant::now(), [16384; N]),
+            ))
+            .unwrap();
+            let mut output = [0.0; 2 * N];
+            render(&mut output[..2 * N - silence]);
+            assert!(output[..N - silence].iter().all(|sample| *sample == 0.25));
+            assert!(
+                output[N - silence..2 * N - silence]
+                    .iter()
+                    .all(|sample| *sample == 0.5)
+            );
+            assert_eq!(state.underrun_samples.load(Relaxed), silence as u64);
+        }
     }
 
     #[test]
