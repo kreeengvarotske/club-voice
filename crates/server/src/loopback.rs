@@ -9,11 +9,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+const PEER_IDLE_LIMIT: Duration = Duration::from_secs(30);
+
 pub struct LocalHost {
     socket: UdpSocket,
     rooms: RoomServer,
     peers: HashMap<SocketAddr, Peer>,
     last_stream: u64,
+    next_expiry: Option<Instant>,
 }
 
 struct Peer {
@@ -29,6 +32,7 @@ impl LocalHost {
             rooms: RoomServer::new(config),
             peers: HashMap::new(),
             last_stream: 0,
+            next_expiry: None,
         })
     }
 
@@ -56,13 +60,7 @@ impl LocalHost {
             other => other?,
         };
         let now = Instant::now();
-        self.peers.retain(|_, peer| {
-            let live = now.duration_since(peer.seen) < Duration::from_secs(30);
-            if !live {
-                self.rooms.leave_lobby(&peer.name);
-            }
-            live
-        });
+        self.expire_peers(now);
         let response = match &packet[..size] {
             bytes if bytes.starts_with(club_voice_protocol::media::MAGIC) => {
                 if let Some((header, _)) = club_voice_protocol::media::Header::parse(bytes)
@@ -130,6 +128,22 @@ impl LocalHost {
         Ok(())
     }
 
+    fn expire_peers(&mut self, now: Instant) {
+        if self.next_expiry.is_none_or(|deadline| now < deadline) {
+            return;
+        }
+        self.next_expiry = None;
+        self.peers.retain(|_, peer| {
+            let deadline = peer.seen + PEER_IDLE_LIMIT;
+            if now >= deadline {
+                self.rooms.leave_lobby(&peer.name);
+                return false;
+            }
+            self.next_expiry = Some(self.next_expiry.map_or(deadline, |next| next.min(deadline)));
+            true
+        });
+    }
+
     fn join(&mut self, peer: SocketAddr, packet: &[u8], now: Instant, media: bool) -> &'static str {
         let Some((name, password)) = std::str::from_utf8(packet)
             .ok()
@@ -164,10 +178,51 @@ impl LocalHost {
                         stream: if media { self.last_stream } else { 0 },
                     },
                 );
+                // Activity moves deadlines forward. An earlier cached deadline can stay
+                // until the next scan, when we recalculate it for all surviving peers.
+                self.next_expiry.get_or_insert(now + PEER_IDLE_LIMIT);
                 "LOBBY"
             }
             Err(AdmissionError::ServerFull) => "FULL",
             Err(_) => "INVALID",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expiry_releases_capacity_and_preserves_refreshed_sessions() {
+        let mut host = LocalHost::bind(
+            0,
+            ServerConfig {
+                name: "Test".into(),
+                password: "test".into(),
+                member_limit: 2,
+            },
+        )
+        .unwrap();
+        let alice = (Ipv4Addr::LOCALHOST, 10001).into();
+        let bob = (Ipv4Addr::LOCALHOST, 10002).into();
+        let start = Instant::now();
+        let refreshed = start + Duration::from_secs(1);
+        assert_eq!(host.join(alice, b"Alice\0test", start, true), "LOBBY");
+        assert_eq!(host.join(bob, b"Bob\0test", start, true), "LOBBY");
+        assert_eq!(host.join(bob, b"Bob\0test", refreshed, true), "LOBBY");
+        let alice_stream = host.peers[&alice].stream;
+        let deadline = start + PEER_IDLE_LIMIT;
+        host.expire_peers(deadline - Duration::from_millis(1));
+        assert_eq!(host.rooms.member_count(), 2);
+        host.expire_peers(deadline);
+        assert_eq!(host.rooms.member_count(), 1);
+        assert!(!host.peers.contains_key(&alice));
+        assert_eq!(host.next_expiry, Some(refreshed + PEER_IDLE_LIMIT));
+        assert_eq!(host.join(alice, b"Alice\0test", deadline, true), "LOBBY");
+        assert!(host.peers[&alice].stream > alice_stream);
+        host.expire_peers(refreshed + PEER_IDLE_LIMIT);
+        assert!(!host.peers.contains_key(&bob));
+        assert!(host.peers.contains_key(&alice));
     }
 }
