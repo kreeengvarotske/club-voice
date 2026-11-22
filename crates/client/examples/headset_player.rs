@@ -23,6 +23,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const N: usize = 960;
 const MAX_AGE: Duration = Duration::from_millis(80);
 const HEARTBEAT: Duration = Duration::from_secs(5);
+const PLAYBACK_BATCHES: usize = 2;
 type Frame = (Instant, [i16; N]);
 type PlaybackFrame = (u64, Frame);
 
@@ -54,6 +55,8 @@ struct State {
     deafened: AtomicBool,
     dropped_capture: AtomicU64,
     dropped_playback: AtomicU64,
+    playback_queue_full: AtomicU64,
+    underrun_samples: AtomicU64,
     concealed: AtomicU64,
     sent: AtomicU64,
     received: AtomicU64,
@@ -98,9 +101,19 @@ fn playback(
     rx: Receiver<PlaybackBatch>,
     state: Arc<State>,
 ) -> impl FnMut(&mut [f32]) {
+    playback_with_observer(channels, rx, state, |_| {})
+}
+
+fn playback_with_observer(
+    channels: usize,
+    rx: Receiver<PlaybackBatch>,
+    state: Arc<State>,
+    mut on_real_frame: impl FnMut(Duration),
+) -> impl FnMut(&mut [f32]) {
     let mut current = None;
     let mut pending = None;
     let mut pos = 0;
+    let mut silent_samples = 0;
     move |samples| {
         samples.fill(0.0);
         let now = Instant::now();
@@ -108,6 +121,7 @@ fn playback(
         if state.deafened.load(Relaxed) {
             current = None;
             pending = None;
+            silent_samples = 0;
             while rx.try_recv().is_ok() {}
             return;
         }
@@ -127,10 +141,28 @@ fn playback(
                 });
                 pos = 0;
                 if current.is_none() {
+                    // Count mono sample periods, independent of output channel count.
+                    silent_samples = (silent_samples + output.len().min(N)).min(N);
+                    state
+                        .underrun_samples
+                        .fetch_add(output.len() as u64, Relaxed);
                     return;
                 }
             }
-            let (_, (_, pcm)) = current.as_ref().unwrap();
+            if pos == 0 && pending.is_some() {
+                // Those output periods already passed as silence during the gap.
+                pos = std::mem::take(&mut silent_samples);
+                if pos == N {
+                    current = None;
+                    continue;
+                }
+            }
+            silent_samples = 0;
+            let (_, (at, pcm)) = current.as_ref().unwrap();
+            // A pending second frame marks the first one as synthetic PLC.
+            if pos == 0 && pending.is_none() {
+                on_real_frame(now.saturating_duration_since(*at));
+            }
             let count = (N - pos).min(output.len());
             for (channels_out, sample) in output.by_ref().take(count).zip(&pcm[pos..pos + count]) {
                 channels_out.fill(*sample as f32 / 32768.0);
@@ -276,7 +308,10 @@ fn receive(
         } else {
             PlaybackBatch::one(header.stream, (at, frame))
         };
-        if tx.try_send(batch).is_err() {
+        if let Err(error) = tx.try_send(batch) {
+            if matches!(error, mpsc::TrySendError::Full(_)) {
+                state.playback_queue_full.fetch_add(1, Relaxed);
+            }
             state.dropped_playback.fetch_add(1, Relaxed);
         }
         state.received.fetch_add(1, Relaxed);
@@ -376,7 +411,7 @@ fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
     let o = config(output.supported_output_configs()?)?;
     let state = Arc::new(State::default());
     let (cap_tx, cap_rx) = mpsc::sync_channel(2);
-    let (play_tx, play_rx) = mpsc::sync_channel(1);
+    let (play_tx, play_rx) = mpsc::sync_channel(PLAYBACK_BATCHES);
     let (stop, done) = mpsc::sync_channel::<Result<()>>(1);
     let on_error = || {
         let stop = stop.clone();
@@ -434,11 +469,13 @@ fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
     drop(microphone);
     drop(headphones);
     println!(
-        "sent={} decoded={} capture_drops={} playback_drops={}",
+        "sent={} decoded={} capture_drops={} playback_drops={} playback_queue_full={} underrun_samples={}",
         state.sent.load(Relaxed),
         state.received.load(Relaxed),
         state.dropped_capture.load(Relaxed),
-        state.dropped_playback.load(Relaxed)
+        state.dropped_playback.load(Relaxed),
+        state.playback_queue_full.load(Relaxed),
+        state.underrun_samples.load(Relaxed)
     );
     result
 }
@@ -457,9 +494,13 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
         .map(|value| value.parse::<u32>())
         .transpose()?;
     let (cap_tx, cap_rx) = mpsc::sync_channel(2);
-    let (play_tx, play_rx) = mpsc::sync_channel(1);
+    let (play_tx, play_rx) = mpsc::sync_channel(PLAYBACK_BATCHES);
     let mut record = capture(1, cap_tx, state.clone());
-    let mut render = playback(2, play_rx, state.clone());
+    let mut ages = [0u32; MAX_AGE.as_millis() as usize + 1];
+    let mut render = playback_with_observer(2, play_rx, state.clone(), |age| {
+        let bucket = age.as_nanos().div_ceil(1_000_000) as usize;
+        ages[bucket] += 1;
+    });
     let input: [f32; N] =
         std::array::from_fn(|i| (std::f32::consts::TAU * 500.0 * i as f32 / 48000.0).sin() * 0.15);
     let mut output = [0.0; N * 2];
@@ -490,16 +531,32 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
         Ok(())
     })?;
     println!(
-        "sent={} decoded={} concealed={} audible_blocks={} streams_heard={}",
+        "sent={} decoded={} concealed={} audible_blocks={} streams_heard={} playback_queue_full={} underrun_samples={}",
         state.sent.load(Relaxed),
         state.received.load(Relaxed),
         state.concealed.load(Relaxed),
         audible,
-        state.streams_heard.load(Relaxed)
+        state.streams_heard.load(Relaxed),
+        state.playback_queue_full.load(Relaxed),
+        state.underrun_samples.load(Relaxed)
     );
     if audible < 50 {
         return Err("expected at least one second of received signal".into());
     }
+    drop(render);
+    let frames: u32 = ages.iter().sum();
+    if frames == 0 {
+        return Err("no real frames rendered".into());
+    }
+    let mut cumulative = 0;
+    let p95 = ages.iter().position(|count| {
+        cumulative += count;
+        cumulative >= (frames * 95).div_ceil(100)
+    });
+    println!(
+        "rendered_real_frames={frames} send_to_render_p95_ms={}",
+        p95.unwrap()
+    );
     Ok(())
 }
 
@@ -562,9 +619,14 @@ mod tests {
             (Instant::now(), [16384; N]),
         ))
         .unwrap();
-        let mut render = playback(1, rx, state);
+        let mut observed = 0;
+        let mut render = playback_with_observer(1, rx, state, |_| observed += 1);
         let mut output = [0.0; N * 2];
-        render(&mut output);
+        let (start, rest) = output.split_at_mut(N + 1);
+        render(start);
+        render(rest);
+        drop(render);
+        assert_eq!(observed, 1);
         assert!(output[..N].iter().all(|sample| *sample == 0.25));
         assert!(output[N..].iter().all(|sample| *sample == 0.5));
 
@@ -582,6 +644,34 @@ mod tests {
             panic!("recovery batch unexpectedly disconnected");
         };
         assert!(batch.second.is_some());
+    }
+
+    #[test]
+    fn concealment_only_fills_the_part_of_the_gap_not_already_rendered() {
+        for silence in [N / 2, N] {
+            let state = Arc::new(State::default());
+            let (tx, rx) = mpsc::sync_channel(PLAYBACK_BATCHES);
+            let mut render = playback(1, rx, state.clone());
+            let mut gap = [1.0; N];
+            render(&mut gap[..silence]);
+            assert!(gap[..silence].iter().all(|sample| *sample == 0.0));
+
+            tx.try_send(PlaybackBatch::recovered(
+                1,
+                (Instant::now(), [8192; N]),
+                (Instant::now(), [16384; N]),
+            ))
+            .unwrap();
+            let mut output = [0.0; 2 * N];
+            render(&mut output[..2 * N - silence]);
+            assert!(output[..N - silence].iter().all(|sample| *sample == 0.25));
+            assert!(
+                output[N - silence..2 * N - silence]
+                    .iter()
+                    .all(|sample| *sample == 0.5)
+            );
+            assert_eq!(state.underrun_samples.load(Relaxed), silence as u64);
+        }
     }
 
     #[test]
@@ -608,12 +698,12 @@ mod tests {
     #[test]
     fn stereo_callback_spans_frames_and_pads_underrun_with_silence() {
         let state = Arc::new(State::default());
-        let (tx, rx) = mpsc::sync_channel(2);
-        tx.send(PlaybackBatch::one(1, (Instant::now(), [16384; N])))
+        let (tx, rx) = mpsc::sync_channel(PLAYBACK_BATCHES);
+        tx.try_send(PlaybackBatch::one(1, (Instant::now(), [16384; N])))
             .unwrap();
-        tx.send(PlaybackBatch::one(1, (Instant::now(), [-16384; N])))
+        tx.try_send(PlaybackBatch::one(1, (Instant::now(), [-16384; N])))
             .unwrap();
-        let mut render = playback(2, rx, state);
+        let mut render = playback(2, rx, state.clone());
         let mut first = [0.0; 2 * (N + 3)];
         render(&mut first);
         assert!(first[..2 * N].iter().all(|v| *v == 0.5));
@@ -622,6 +712,10 @@ mod tests {
         render(&mut rest);
         assert!(rest[..2 * (N - 3)].iter().all(|v| *v == -0.5));
         assert!(rest[2 * (N - 3)..].iter().all(|v| *v == 0.0));
+        assert_eq!(state.underrun_samples.load(Relaxed), 3);
+        state.deafened.store(true, Relaxed);
+        render(&mut rest);
+        assert_eq!(state.underrun_samples.load(Relaxed), 3);
     }
     #[test]
     fn mute_discards_partial_frame_before_resuming() {
