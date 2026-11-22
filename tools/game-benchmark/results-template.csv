@@ -1,0 +1,7 @@
+run,condition,start_local_time,capture_file,frames,seconds,avg_fps,p95_ms,p99_ms,client1_cpu_pct_one_core,client1_max_private_mib,client1_max_working_set_mib,client2_cpu_pct_one_core,client2_max_private_mib,client2_max_working_set_mib,server_cpu_pct_one_core,server_max_working_set_mib,client_decoded_frames,client_playback_queue_full,client_underrun_samples,input_latency_ms,notes
+1,voice_off,,,,,,,,,,,,,,,,,,,,
+2,voice_on,,,,,,,,,,,,,,,,,,,,
+3,voice_on,,,,,,,,,,,,,,,,,,,,
+4,voice_off,,,,,,,,,,,,,,,,,,,,
+5,voice_off,,,,,,,,,,,,,,,,,,,,
+6,voice_on,,,,,,,,,,,,,,,,,,,,
