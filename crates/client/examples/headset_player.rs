@@ -186,11 +186,16 @@ fn transmit(socket: &UdpSocket, rx: Receiver<Frame>, state: &State, stream: u64)
     let mut seq = 0u32;
     let mut heartbeat = Instant::now();
     while state.running.load(Relaxed) {
-        if heartbeat.elapsed() >= HEARTBEAT {
+        let elapsed = heartbeat.elapsed();
+        let wait = if elapsed >= HEARTBEAT {
             socket.send(&club_voice_protocol::media::SessionCommand::Ping.packet(stream))?;
             heartbeat = Instant::now();
-        }
-        match rx.recv_timeout(Duration::from_millis(50)) {
+            HEARTBEAT
+        } else {
+            HEARTBEAT - elapsed
+        };
+        match rx.recv_timeout(wait) {
+            Ok(_) if !state.running.load(Relaxed) => break,
             Ok((at, pcm)) if at.elapsed() <= MAX_AGE && !state.muted.load(Relaxed) => {
                 let size = encoder.encode(&pcm, &mut payload)?;
                 let sent_us = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64;
@@ -468,9 +473,10 @@ fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
         });
         let result = done.recv();
         state.running.store(false, Relaxed);
+        // Closing the capture channel wakes the sender even while muted.
+        drop(microphone);
         result
     })?;
-    drop(microphone);
     drop(headphones);
     println!(
         "sent={} decoded={} capture_drops={} playback_drops={} concealed={} plc_rendered_samples={} playback_queue_full={} underrun_samples={}",
@@ -550,6 +556,7 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
             }
         }
         state.running.store(false, Relaxed);
+        drop(record);
         sender.join().expect("sender panicked")?;
         receiver.join().expect("receiver panicked")?;
         Ok(())
@@ -588,6 +595,33 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn idle_sender_heartbeats_and_stops_when_capture_closes() {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        server.set_read_timeout(Some(HEARTBEAT * 2)).unwrap();
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket.connect(server.local_addr().unwrap()).unwrap();
+        let state = State::default();
+        state.running.store(true, Relaxed);
+        state.muted.store(true, Relaxed);
+        thread::scope(|scope| {
+            let (capture, frames) = mpsc::sync_channel(2);
+            let (finished, done) = mpsc::channel();
+            let (socket, state) = (&socket, &state);
+            scope.spawn(move || {
+                finished.send(transmit(socket, frames, state, 1)).unwrap();
+            });
+            let mut packet = [0; 32];
+            let (len, _) = server.recv_from(&mut packet).unwrap();
+            assert_eq!(
+                &packet[..len],
+                &club_voice_protocol::media::SessionCommand::Ping.packet(1)
+            );
+            drop(capture);
+            done.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        });
+    }
+
     #[test]
     fn probe_skips_elapsed_ticks_after_a_scheduler_stall() {
         let due = Instant::now();
