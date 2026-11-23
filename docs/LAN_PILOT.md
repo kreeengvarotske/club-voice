@@ -2,6 +2,8 @@
 
 Extract the same ZIP on both PCs and connect them to the same trusted local network. The pilot uses unencrypted UDP and a temporary room password. Use it only on a trusted LAN.
 
+Use [the LAN acceptance checklist](LAN_ACCEPTANCE.md) to prepare both machines and run every check in one visit. The ZIP includes the checklist as `Acceptance.md`.
+
 ## Start the server on PC 1
 
 1. Connect your headset and select it as the default input and output in Windows.

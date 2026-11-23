@@ -13,6 +13,7 @@ Copy-Item (Join-Path $release 'examples/local_control.exe') $bundle
 Copy-Item (Join-Path $release 'examples/headset_player.exe') $bundle
 Copy-Item (Join-Path $release 'club-voice-device-check.exe') $bundle
 Copy-Item 'docs/LAN_PILOT.md' (Join-Path $bundle 'README.txt')
+Copy-Item 'docs/LAN_ACCEPTANCE.md' (Join-Path $bundle 'Acceptance.md')
 
 function Write-Launcher([string]$Name, [string[]]$Commands) {
     $lines = @('@echo off', 'chcp 65001 >nul') + $Commands + @('echo.', 'pause')
@@ -27,7 +28,7 @@ Write-Launcher 'Check-Devices.cmd' @('"%~dp0headset_player.exe" --check-devices'
 Write-Launcher 'List-Devices.cmd' @('"%~dp0club-voice-device-check.exe" --list-devices')
 
 $files = @(
-    'local_control.exe', 'headset_player.exe', 'club-voice-device-check.exe', 'README.txt',
+    'local_control.exe', 'headset_player.exe', 'club-voice-device-check.exe', 'README.txt', 'Acceptance.md',
     'Host-LAN.cmd', 'Join-LAN.cmd', 'Play-Test-Tone.cmd', 'Check-LAN.cmd',
     'Check-Devices.cmd', 'List-Devices.cmd'
 ) | ForEach-Object { Join-Path $bundle $_ }
