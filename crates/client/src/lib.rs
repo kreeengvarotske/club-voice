@@ -20,13 +20,23 @@ pub fn join_lan_voice(
     name: &str,
     password: &str,
 ) -> std::io::Result<u64> {
-    if !matches!(socket.peer_addr()?.ip(), std::net::IpAddr::V4(ip) if ip.is_private()) {
+    let address = socket.peer_addr()?;
+    if !matches!(address.ip(), std::net::IpAddr::V4(ip) if ip.is_private()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "expected a private IPv4 server",
         ));
     }
-    join_voice(socket, name, password)
+    join_voice(socket, name, password).map_err(|e| {
+        use std::io::{Error, ErrorKind};
+        if matches!(e.kind(), ErrorKind::ConnectionReset | ErrorKind::ConnectionRefused | ErrorKind::TimedOut) {
+            Error::new(e.kind(), format!(
+                "voice server at {address} did not respond. Check the address and port printed by Host-LAN and keep the server window open"
+            ))
+        } else {
+            e
+        }
+    })
 }
 
 fn join_voice(socket: &std::net::UdpSocket, name: &str, password: &str) -> std::io::Result<u64> {

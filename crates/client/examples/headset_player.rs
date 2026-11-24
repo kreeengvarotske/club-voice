@@ -450,11 +450,11 @@ fn prompt(label: &str) -> io::Result<String> {
 }
 
 fn prompt_lan_address() -> Result<SocketAddrV4> {
-    let address: SocketAddrV4 = prompt("Server address (IPv4:port)")?.parse()?;
-    if !address.ip().is_private() {
-        return Err("enter a private IPv4 server address".into());
-    }
-    Ok(address)
+    let port = club_voice_protocol::LAN_PORT;
+    let input = prompt(&format!(
+        "Server address (IPv4 or IPv4:port, default {port})"
+    ))?;
+    Ok(club_voice_protocol::parse_lan_address(&input)?)
 }
 
 fn connect_lan(address: SocketAddrV4) -> io::Result<UdpSocket> {
@@ -479,7 +479,15 @@ fn join_lan(tone: bool) -> Result<()> {
         session(&socket, stream)
     };
     let _ = socket.send(&club_voice_protocol::media::SessionCommand::Leave.packet(stream));
-    result
+    result.map_err(|e| {
+        if e.downcast_ref::<io::Error>().is_some_and(|e| {
+            matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused)
+        }) {
+            format!("Lost connection to voice server at {address}. Restart or check the server, then rejoin.").into()
+        } else {
+            e
+        }
+    })
 }
 
 fn check_lan() -> Result<()> {

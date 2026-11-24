@@ -1,11 +1,13 @@
+use club_voice_protocol::{LAN_PORT, parse_lan_address};
 use club_voice_server::{ServerConfig, loopback::LocalHost};
 use std::io::{self, Write};
-use std::net::SocketAddrV4;
 
 fn main() -> io::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("--lan") {
-        let address: SocketAddrV4 = prompt("Bind address (private IPv4:port)")?
-            .parse()
+        let input = prompt(&format!(
+            "Bind address (private IPv4, default port {LAN_PORT})"
+        ))?;
+        let address = parse_lan_address(&input)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let password = prompt("Room password (8–128 bytes)")?;
         let mut host = LocalHost::bind_lan(

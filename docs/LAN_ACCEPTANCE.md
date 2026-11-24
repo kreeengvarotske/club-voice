@@ -15,7 +15,7 @@ Use these steps in order. On Windows run the named `.cmd` files. On Mac use the 
 
 | Check | Action | Pass evidence |
 | --- | --- | --- |
-| 1. Start the host | Run `Host-LAN.cmd` on Windows. Enter the active private IPv4 address followed by `:40771` and a temporary password. | The server prints `LAN pilot listening on ...`. |
+| 1. Start the host | Run `Host-LAN.cmd` on Windows. Enter the active private IPv4 address and a temporary password. The default port is 40771. | The server prints `LAN pilot listening on ...`. |
 | 2. Automated duplex | On the host, run `Play-Test-Tone.cmd`. On the other PC, run `Check-LAN` after the host prints `READY`. Enter the address and password. | PC 2 prints `PASS: LAN check complete`. PC 1 reports `streams_heard=2` at the end of the two-minute tone run. Save both summaries. This covers password rejection, synthetic audio, confirmed departure and rejoin. |
 | 3. Live speech | After the tone peer finishes, run `Join-LAN` on both PCs. Confirm microphone use explicitly and speak using both headsets. | Both people hear intelligible speech. Note any persistent gaps, clipping or echo. |
 | 4. Controls | With active speech, try `mute` and `unmute` on one PC. Try `deafen` and `undeafen` on the other. | Each control takes effect in the expected direction and speech returns after undo. |

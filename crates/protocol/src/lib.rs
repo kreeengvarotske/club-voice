@@ -4,11 +4,29 @@
 //! queue below: stale media must be discarded at the playout boundary instead.
 
 use std::collections::VecDeque;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 pub mod media;
 
 pub const DEFAULT_ROOMS: [&str; 3] = ["Lobby", "Team A", "Team B"];
 pub const MAX_CONTROL_BYTES: usize = 4 * 1024;
+pub const LAN_PORT: u16 = 40771;
+
+pub fn parse_lan_address(input: &str) -> Result<SocketAddrV4, &'static str> {
+    let input = input.trim();
+    let address = if input.contains(':') {
+        input.parse::<SocketAddrV4>()
+    } else {
+        input
+            .parse::<Ipv4Addr>()
+            .map(|ip| SocketAddrV4::new(ip, LAN_PORT))
+    }
+    .map_err(|_| "enter an IPv4 address or IPv4:port")?;
+    if !address.ip().is_private() {
+        return Err("enter a private IPv4 address for the LAN pilot");
+    }
+    Ok(address)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinRequest {
@@ -87,6 +105,18 @@ impl<T> BoundedQueue<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lan_address_accepts_bare_ipv4_and_preserves_explicit_ports() {
+        assert_eq!(
+            parse_lan_address(" 192.168.1.42 ").unwrap().port(),
+            LAN_PORT
+        );
+        assert_eq!(parse_lan_address("10.0.0.2:40802").unwrap().port(), 40802);
+        assert!(parse_lan_address("10.0.0.2:wrong").is_err());
+        assert!(parse_lan_address("0.0.0.0:40771").is_err());
+        assert!(parse_lan_address("127.0.0.1:40771").is_err());
+    }
 
     #[test]
     fn rejects_an_empty_display_name() {

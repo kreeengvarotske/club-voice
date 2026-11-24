@@ -7,7 +7,7 @@ Use [the LAN acceptance checklist](LAN_ACCEPTANCE.md) to prepare both machines a
 ## Start the server on PC 1
 
 1. Connect your headset and select it as the default input and output in Windows.
-2. Double-click `Host-LAN.cmd`. Find the IPv4 address of the active Ethernet or Wi-Fi adapter in the printed list. Enter that address followed by `:40771`, for example `192.168.1.42:40771`.
+2. Double-click `Host-LAN.cmd`. Find the IPv4 address of the active Ethernet or Wi-Fi adapter in the printed list and enter it, for example `192.168.1.42`. The host and clients use port 40771 when you omit it. If you choose a different port, use the full address printed by the host on both clients.
 3. Enter a temporary room password of at least eight characters. Keep the server window open. If Windows prompts for network access, use the private network profile only.
 
 ## Run the automatic check
