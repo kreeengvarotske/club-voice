@@ -1164,4 +1164,470 @@ mod tests {
         render(&mut pair);
         assert_eq!(pair, [0.0; 2]);
     }
+
+    /// Network playback tests (Issue #1, task 1). They drive the real
+    /// `receive` loop over a localhost UDP socket pair with CVM2 datagrams in
+    /// a chosen order. Every sequence carries its own tone so each decoded
+    /// frame can be traced back to the packet it came from.
+    mod network_playback {
+        use super::*;
+
+        const TONE_BASE_HZ: f32 = 300.0;
+        const TONE_STEP_HZ: f32 = 200.0;
+        const STREAM: u64 = 9;
+
+        fn tone_hz(sequence: u32) -> f32 {
+            TONE_BASE_HZ + TONE_STEP_HZ * sequence as f32
+        }
+
+        fn power(pcm: &[i16; N], hz: f32) -> f32 {
+            let w = std::f32::consts::TAU * hz / 48_000.0;
+            let c = 2.0 * w.cos();
+            let (mut s1, mut s2) = (0.0f32, 0.0f32);
+            for &v in pcm {
+                let s0 = v as f32 + c * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            s1 * s1 + s2 * s2 - c * s1 * s2
+        }
+
+        /// The sequence (out of `0..count`) whose tone dominates `pcm`.
+        fn identify(pcm: &[i16; N], count: u32) -> u32 {
+            (0..count)
+                .max_by(|a, b| power(pcm, tone_hz(*a)).total_cmp(&power(pcm, tone_hz(*b))))
+                .unwrap()
+        }
+
+        /// What one playback batch contained.
+        #[derive(Debug, PartialEq)]
+        enum Played {
+            Real(u32),
+            ConcealedThenReal(u32),
+        }
+
+        struct Run {
+            played: Vec<Played>,
+            batches: Vec<PlaybackBatch>,
+            state: Arc<State>,
+        }
+
+        /// Encode sequences `0..count` in order, send them in `order`, and
+        /// collect what `receive` queues for playback.
+        fn run(count: u32, order: &[u32]) -> Run {
+            let mut encoder = FrameEncoder::new(&Config::default()).unwrap();
+            let mut payload = [0; MAX_OPUS_PACKET];
+            let payloads: Vec<Vec<u8>> = (0..count)
+                .map(|seq| {
+                    let w = std::f32::consts::TAU * tone_hz(seq) / 48_000.0;
+                    let pcm: [i16; N] =
+                        std::array::from_fn(|i| ((w * i as f32).sin() * 8000.0) as i16);
+                    let n = encoder.encode(&pcm, &mut payload).unwrap();
+                    payload[..n].to_vec()
+                })
+                .collect();
+
+            let local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+            let listener = UdpSocket::bind(local).unwrap();
+            let sender = UdpSocket::bind(local).unwrap();
+            listener.connect(sender.local_addr().unwrap()).unwrap();
+            sender.connect(listener.local_addr().unwrap()).unwrap();
+            listener
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+
+            let state = Arc::new(State::default());
+            state.running.store(true, Relaxed);
+            // Larger than any test sends, so queue capacity never hides a result.
+            let (tx, rx) = mpsc::sync_channel(64);
+            let expected_datagrams = order.len() as u64;
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| receive(&listener, tx, &state, None));
+                let mut packet = [0; MAX_DATAGRAM];
+                for &seq in order {
+                    let sent_us = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
+                    Header {
+                        stream: STREAM,
+                        frame_ms: 20,
+                        sequence: seq,
+                        sent_us,
+                    }
+                    .write(&mut packet);
+                    let body = &payloads[seq as usize];
+                    packet[HEADER..HEADER + body.len()].copy_from_slice(body);
+                    sender.send(&packet[..HEADER + body.len()]).unwrap();
+                }
+                // Every datagram ends as either a queued batch or a counted drop.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while state.received.load(Relaxed) + state.dropped_playback.load(Relaxed)
+                    < expected_datagrams
+                {
+                    assert!(Instant::now() < deadline, "receive loop stalled");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                state.running.store(false, Relaxed);
+                worker.join().unwrap().unwrap();
+            });
+
+            let batches: Vec<PlaybackBatch> = rx.try_iter().collect();
+            let played = batches
+                .iter()
+                .map(|b| match &b.second {
+                    None => Played::Real(identify(&b.first.1.1, count)),
+                    Some((_, (_, pcm))) => Played::ConcealedThenReal(identify(pcm, count)),
+                })
+                .collect();
+            eprintln!(
+                "order={order:?} received={} concealed={} dropped_playback={} batches={}",
+                state.received.load(Relaxed),
+                state.concealed.load(Relaxed),
+                state.dropped_playback.load(Relaxed),
+                batches.len()
+            );
+            Run {
+                played,
+                batches,
+                state,
+            }
+        }
+
+        /// Render every queued batch, then one more frame; return the number
+        /// of real frames rendered and the silence requested afterwards.
+        fn render_all(run: Run) -> (usize, u64) {
+            let Run { batches, state, .. } = run;
+            let frames: usize = batches
+                .iter()
+                .map(|b| 1 + b.second.is_some() as usize)
+                .sum();
+            let (tx, rx) = mpsc::sync_channel(batches.len().max(1));
+            for b in batches {
+                tx.send(b).unwrap();
+            }
+            let mut real = 0;
+            let mut render = playback_with_observer(1, rx, state.clone(), |_| real += 1);
+            let mut out = vec![0.0; frames * N];
+            render(&mut out);
+            assert_eq!(state.underrun_samples.load(Relaxed), 0);
+            let mut extra = [0.0; N];
+            render(&mut extra);
+            drop(render);
+            (real, state.underrun_samples.load(Relaxed))
+        }
+
+        #[test]
+        fn swapped_pair_conceals_once_and_discards_the_late_frame() {
+            let run = run(6, &[0, 1, 3, 2, 4, 5]);
+            assert_eq!(
+                run.played,
+                [
+                    Played::Real(0),
+                    Played::Real(1),
+                    Played::ConcealedThenReal(3),
+                    Played::Real(4),
+                    Played::Real(5),
+                ]
+            );
+            assert_eq!(run.state.concealed.load(Relaxed), 1);
+            assert_eq!(run.state.dropped_playback.load(Relaxed), 1);
+            assert_eq!(run.state.received.load(Relaxed), 5);
+        }
+
+        #[test]
+        fn duplicate_frame_is_discarded_and_playback_continues() {
+            let run = run(4, &[0, 1, 1, 2, 3]);
+            assert_eq!(
+                run.played,
+                [
+                    Played::Real(0),
+                    Played::Real(1),
+                    Played::Real(2),
+                    Played::Real(3)
+                ]
+            );
+            assert_eq!(run.state.concealed.load(Relaxed), 0);
+            assert_eq!(run.state.dropped_playback.load(Relaxed), 1);
+        }
+
+        #[test]
+        fn burst_resumes_on_next_valid_frame_without_concealment_backlog() {
+            for missing in [3u32, 5, 10] {
+                let resume = 3 + missing;
+                let count = resume + 2;
+                let run = run(count, &[0, 1, 2, resume, resume + 1]);
+                assert_eq!(
+                    run.played,
+                    [
+                        Played::Real(0),
+                        Played::Real(1),
+                        Played::Real(2),
+                        Played::Real(resume),
+                        Played::Real(resume + 1),
+                    ],
+                    "burst of {missing}"
+                );
+                assert_eq!(run.state.concealed.load(Relaxed), 0);
+                assert_eq!(run.state.dropped_playback.load(Relaxed), 0);
+                // Exactly the five real frames are rendered; nothing is left
+                // queued, so the next callback is pure underrun.
+                let (real, underrun) = render_all(run);
+                assert_eq!(real, 5, "burst of {missing}");
+                assert_eq!(underrun, N as u64, "burst of {missing}");
+            }
+        }
+
+        #[test]
+        fn burst_member_arriving_after_resume_is_discarded() {
+            let run = run(9, &[0, 1, 2, 6, 4, 7, 8]);
+            assert_eq!(
+                run.played,
+                [
+                    Played::Real(0),
+                    Played::Real(1),
+                    Played::Real(2),
+                    Played::Real(6),
+                    Played::Real(7),
+                    Played::Real(8),
+                ]
+            );
+            assert_eq!(run.state.concealed.load(Relaxed), 0);
+            assert_eq!(run.state.dropped_playback.load(Relaxed), 1);
+        }
+
+        /// What one rendered 20 ms output period contained.
+        #[derive(Debug, PartialEq)]
+        enum Heard {
+            Real(u32),
+            Concealed,
+            Silence,
+        }
+
+        /// UDP socket pair -> real `receive` loop -> real bounded playback
+        /// queue (`PLAYBACK_BATCHES`) -> real output callback, stepped in
+        /// lockstep so every case is deterministic.
+        struct Pipeline {
+            count: u32,
+            payloads: Vec<Vec<u8>>,
+            sender: UdpSocket,
+            state: Arc<State>,
+            played: Arc<AtomicU64>,
+            sent: u64,
+        }
+
+        impl Pipeline {
+            fn send(&mut self, seq: u32) {
+                let before = self.processed();
+                let sent_us = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as u64;
+                let mut packet = [0; MAX_DATAGRAM];
+                Header {
+                    stream: STREAM,
+                    frame_ms: 20,
+                    sequence: seq,
+                    sent_us,
+                }
+                .write(&mut packet);
+                let body = &self.payloads[seq as usize];
+                packet[HEADER..HEADER + body.len()].copy_from_slice(body);
+                self.sender.send(&packet[..HEADER + body.len()]).unwrap();
+                self.sent += 1;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while self.processed() == before {
+                    assert!(Instant::now() < deadline, "receive loop stalled");
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+
+            /// Every datagram is decoded (`received`) or dropped before decode
+            /// (late/duplicate); a queue-full drop increments both.
+            fn processed(&self) -> u64 {
+                self.state.received.load(Relaxed) + self.state.dropped_playback.load(Relaxed)
+            }
+
+            fn counters(&self) -> String {
+                let s = &self.state;
+                format!(
+                    "datagrams={} decoded={} played_real={} concealed={} plc_rendered_samples={} \
+                     playback_queue_full={} dropped_playback={} underrun_samples={}",
+                    self.sent,
+                    s.received.load(Relaxed),
+                    self.played.load(Relaxed),
+                    s.concealed.load(Relaxed),
+                    s.plc_rendered_samples.load(Relaxed),
+                    s.playback_queue_full.load(Relaxed),
+                    s.dropped_playback.load(Relaxed),
+                    s.underrun_samples.load(Relaxed),
+                )
+            }
+        }
+
+        /// Run `script` against a live pipeline. `script` gets the pipeline
+        /// and a `render` closure that renders one 20 ms period.
+        fn pipeline(
+            count: u32,
+            script: impl FnOnce(&mut Pipeline, &mut dyn FnMut(&Pipeline) -> Heard),
+        ) -> Pipeline {
+            let mut encoder = FrameEncoder::new(&Config::default()).unwrap();
+            let mut payload = [0; MAX_OPUS_PACKET];
+            let payloads: Vec<Vec<u8>> = (0..count)
+                .map(|seq| {
+                    let w = std::f32::consts::TAU * tone_hz(seq) / 48_000.0;
+                    let pcm: [i16; N] =
+                        std::array::from_fn(|i| ((w * i as f32).sin() * 8000.0) as i16);
+                    let n = encoder.encode(&pcm, &mut payload).unwrap();
+                    payload[..n].to_vec()
+                })
+                .collect();
+            let local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+            let listener = UdpSocket::bind(local).unwrap();
+            let sender = UdpSocket::bind(local).unwrap();
+            listener.connect(sender.local_addr().unwrap()).unwrap();
+            sender.connect(listener.local_addr().unwrap()).unwrap();
+            listener
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+            let state = Arc::new(State::default());
+            state.running.store(true, Relaxed);
+            let played = Arc::new(AtomicU64::new(0));
+            // The same bounded queue the headset and tone-peer sessions use.
+            let (tx, rx) = mpsc::sync_channel(PLAYBACK_BATCHES);
+            let mut p = Pipeline {
+                count,
+                payloads,
+                sender,
+                state: state.clone(),
+                played: played.clone(),
+                sent: 0,
+            };
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| receive(&listener, tx, &state, None));
+                let counter = played.clone();
+                let mut callback = playback_with_observer(1, rx, state.clone(), move |_| {
+                    counter.fetch_add(1, Relaxed);
+                });
+                let mut render = |p: &Pipeline| {
+                    let plc_before = p.state.plc_rendered_samples.load(Relaxed);
+                    let mut out = [0.0f32; N];
+                    callback(&mut out);
+                    if p.state.plc_rendered_samples.load(Relaxed) > plc_before {
+                        return Heard::Concealed;
+                    }
+                    if out.iter().all(|v| *v == 0.0) {
+                        return Heard::Silence;
+                    }
+                    let pcm: [i16; N] = std::array::from_fn(|i| (out[i] * 32768.0) as i16);
+                    Heard::Real(identify(&pcm, p.count))
+                };
+                script(&mut p, &mut render);
+                state.running.store(false, Relaxed);
+                worker.join().unwrap().unwrap();
+            });
+            eprintln!("{}", p.counters());
+            p
+        }
+
+        #[test]
+        fn queue_path_recovers_output_after_a_loss_burst() {
+            let p = pipeline(9, |p, render| {
+                let mut heard = Vec::new();
+                for seq in 0..3 {
+                    p.send(seq);
+                    heard.push(render(p));
+                }
+                // 3, 4, 5 and 6 are lost: four output periods with nothing to play.
+                for _ in 3..7 {
+                    heard.push(render(p));
+                }
+                for seq in 7..9 {
+                    p.send(seq);
+                    heard.push(render(p));
+                }
+                use Heard::*;
+                assert_eq!(
+                    heard,
+                    [
+                        Real(0),
+                        Real(1),
+                        Real(2),
+                        Silence,
+                        Silence,
+                        Silence,
+                        Silence,
+                        Real(7),
+                        Real(8)
+                    ]
+                );
+            });
+            let s = &p.state;
+            assert_eq!(s.received.load(Relaxed), 5);
+            assert_eq!(p.played.load(Relaxed), 5);
+            assert_eq!(s.concealed.load(Relaxed), 0);
+            assert_eq!(s.plc_rendered_samples.load(Relaxed), 0);
+            assert_eq!(s.underrun_samples.load(Relaxed), 4 * N as u64);
+            assert_eq!(s.dropped_playback.load(Relaxed), 0);
+        }
+
+        #[test]
+        fn queue_path_rejects_a_late_frame_after_its_gap_was_concealed() {
+            let p = pipeline(4, |p, render| {
+                p.send(0);
+                let first = render(p);
+                // 2 overtakes 1: the receiver queues PLC + 2 as one batch.
+                p.send(2);
+                let concealed = render(p);
+                p.send(1);
+                let after_late = render(p);
+                p.send(3);
+                let last = render(p);
+                assert_eq!(
+                    [first, concealed, after_late, last],
+                    [
+                        Heard::Real(0),
+                        Heard::Concealed,
+                        Heard::Real(2),
+                        Heard::Real(3)
+                    ]
+                );
+            });
+            let s = &p.state;
+            assert_eq!(s.received.load(Relaxed), 3);
+            assert_eq!(p.played.load(Relaxed), 3);
+            assert_eq!(s.concealed.load(Relaxed), 1);
+            assert_eq!(s.plc_rendered_samples.load(Relaxed), N as u64);
+            assert_eq!(s.dropped_playback.load(Relaxed), 1);
+            assert_eq!(s.playback_queue_full.load(Relaxed), 0);
+        }
+
+        #[test]
+        fn queue_path_keeps_oldest_batches_when_full_and_resumes_on_next_frame() {
+            let p = pipeline(6, |p, render| {
+                // Output stalls while four frames arrive: only two batches fit.
+                for seq in 0..4 {
+                    p.send(seq);
+                }
+                let mut heard: Vec<Heard> = (0..4).map(|_| render(p)).collect();
+                p.send(4);
+                heard.push(render(p));
+                p.send(5);
+                heard.push(render(p));
+                use Heard::*;
+                assert_eq!(
+                    heard,
+                    [Real(0), Real(1), Silence, Silence, Real(4), Real(5)]
+                );
+            });
+            let s = &p.state;
+            // Frames 2 and 3 were decoded but rejected by the full queue.
+            assert_eq!(s.received.load(Relaxed), 6);
+            assert_eq!(s.playback_queue_full.load(Relaxed), 2);
+            assert_eq!(s.dropped_playback.load(Relaxed), 2);
+            assert_eq!(p.played.load(Relaxed), 4);
+            assert_eq!(s.concealed.load(Relaxed), 0);
+            assert_eq!(s.underrun_samples.load(Relaxed), 2 * N as u64);
+        }
+    }
 }

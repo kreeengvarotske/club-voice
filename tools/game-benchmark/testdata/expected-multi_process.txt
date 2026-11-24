@@ -1,0 +1,1 @@
+process=game.exe pid=4242 frames=100 seconds=1.160 avg_fps=86.21 p95_ms=20.00 p99_ms=50.00
