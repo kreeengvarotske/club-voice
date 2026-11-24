@@ -62,6 +62,8 @@ struct State {
     plc_rendered_samples: AtomicU64,
     sent: AtomicU64,
     received: AtomicU64,
+    rendered_real_frames: AtomicU64,
+    device_xruns: AtomicU64,
     remote_stream: AtomicU64,
     streams_heard: AtomicU64,
 }
@@ -122,6 +124,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn playback<T: Sample + FromSample<i16>>(
     channels: usize,
     rx: Receiver<PlaybackBatch>,
@@ -633,13 +636,27 @@ fn build_playback<T: SizedSample + FromSample<i16> + 'static>(
     state: Arc<State>,
     on_error: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<cpal::Stream> {
-    let mut render = playback::<T>(config.channels.into(), rx, state);
+    let counters = state.clone();
+    let mut render = playback_with_observer::<T>(config.channels.into(), rx, state, move |_| {
+        counters.rendered_real_frames.fetch_add(1, Relaxed);
+    });
     Ok(device.build_output_stream(
         config,
         move |samples, _| render(samples),
         on_error,
         Some(Duration::from_secs(2)),
     )?)
+}
+
+fn audio_error_handler(state: Arc<State>, stop: SyncSender<Result<()>>) -> impl FnMut(cpal::Error) {
+    move |error| {
+        // WASAPI continues delivering buffers after reporting a discontinuity.
+        if cfg!(windows) && error.kind() == cpal::ErrorKind::Xrun {
+            state.device_xruns.fetch_add(1, Relaxed);
+        } else {
+            let _ = stop.try_send(Err(error.into()));
+        }
+    }
 }
 
 fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
@@ -652,12 +669,7 @@ fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
     let (cap_tx, cap_rx) = mpsc::sync_channel(2);
     let (play_tx, play_rx) = mpsc::sync_channel(PLAYBACK_BATCHES);
     let (stop, done) = mpsc::sync_channel::<Result<()>>(1);
-    let on_error = || {
-        let stop = stop.clone();
-        move |e: cpal::Error| {
-            let _ = stop.try_send(Err(e.into()));
-        }
-    };
+    let on_error = || audio_error_handler(state.clone(), stop.clone());
     let microphone = match i.sample_format() {
         SampleFormat::F32 => {
             build_capture::<f32>(&input, i.config(), cap_tx, state.clone(), on_error())
@@ -719,15 +731,17 @@ fn session(socket: &UdpSocket, stream: u64) -> Result<()> {
     })?;
     drop(headphones);
     println!(
-        "sent={} decoded={} capture_drops={} playback_drops={} concealed={} plc_rendered_samples={} playback_queue_full={} underrun_samples={}",
+        "sent={} decoded={} rendered_real_frames={} capture_drops={} playback_drops={} concealed={} plc_rendered_samples={} playback_queue_full={} underrun_samples={} device_xruns={}",
         state.sent.load(Relaxed),
         state.received.load(Relaxed),
+        state.rendered_real_frames.load(Relaxed),
         state.dropped_capture.load(Relaxed),
         state.dropped_playback.load(Relaxed),
         state.concealed.load(Relaxed),
         state.plc_rendered_samples.load(Relaxed),
         state.playback_queue_full.load(Relaxed),
-        state.underrun_samples.load(Relaxed)
+        state.underrun_samples.load(Relaxed),
+        state.device_xruns.load(Relaxed)
     );
     result
 }
@@ -863,6 +877,19 @@ fn tone_peer(socket: &UdpSocket, stream: u64) -> Result<()> {
 mod tests {
     use super::*;
     use opus_roundtrip_spike::MAX_OPUS_PACKET;
+
+    #[cfg(windows)]
+    #[test]
+    fn wasapi_discontinuity_counts_without_stopping_but_device_loss_stops() {
+        let state = Arc::new(State::default());
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut on_error = audio_error_handler(state.clone(), tx);
+        on_error(cpal::ErrorKind::Xrun.into());
+        assert_eq!(state.device_xruns.load(Relaxed), 1);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        on_error(cpal::ErrorKind::DeviceNotAvailable.into());
+        assert!(rx.try_recv().unwrap().is_err());
+    }
 
     #[test]
     fn selects_integer_fallback_at_48_khz_and_prefers_float() {
