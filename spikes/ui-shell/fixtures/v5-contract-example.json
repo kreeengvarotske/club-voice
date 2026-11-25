@@ -1,0 +1,17 @@
+{
+  "Ok": {
+    "current_room": 3,
+    "member_id": 17,
+    "role": "member",
+    "voice_epoch": 9,
+    "rooms": [
+      {"id":0,"name":"Lobby","parent":null,"access":{"manager_entry":false,"manager_voice":false},"locked":false,"members":[]},
+      {"id":1,"name":"Team A","parent":null,"access":{"manager_entry":false,"manager_voice":false},"locked":false,"members":[]},
+      {"id":2,"name":"Team B","parent":null,"access":{"manager_entry":false,"manager_voice":false},"locked":false,"members":[]},
+      {"id":3,"name":"Briefing","parent":1,"access":{"manager_entry":false,"manager_voice":true},"locked":true,"members":[
+        {"id":17,"name":"Alex","role":"member"},
+        {"id":21,"name":"Sam","role":"room_manager_moderator"}
+      ]}
+    ]
+  }
+}
