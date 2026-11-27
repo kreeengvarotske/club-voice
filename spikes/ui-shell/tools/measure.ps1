@@ -16,6 +16,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Invariant number format so the CSV uses decimal points on any locale.
+[System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
 Add-Type -Namespace CvMeasure -Name Win -MemberDefinition @"
 [DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
 "@
@@ -35,7 +37,7 @@ $gpu = (Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }) -joi
     "gpu=$gpu",
     "ram_gb=$([math]::Round($os.TotalVisibleMemorySize / 1MB, 1))",
     "seconds=$Seconds warmup=$Warmup repeats=$Repeats"
-) | Set-Content $outEnv
+) | Set-Content $outEnv -Encoding utf8
 
 function Get-Tree([int]$RootId) {
     $ids = @($RootId)
@@ -48,7 +50,8 @@ function Measure-One([string]$Toolkit, [string]$Scenario, [int]$Run) {
     $exe = Join-Path $Dir "cv-shell-$Toolkit.exe"
     $mode = if ($Scenario -eq "speaking") { "speaking" } else { "idle" }
     $stdout = Join-Path $env:TEMP "cv-$Toolkit-$Scenario-$Run.out"
-    $exitAfter = $Warmup + $Seconds + 2
+    # The app must outlive the sampling window, or CPU and memory read as zero.
+    $exitAfter = $Warmup + $Seconds + 15
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $p = Start-Process -FilePath $exe -ArgumentList "--scenario $mode --exit-after $exitAfter" `
         -RedirectStandardOutput $stdout -PassThru
@@ -65,8 +68,10 @@ function Measure-One([string]$Toolkit, [string]$Scenario, [int]$Run) {
     foreach ($id in $ids) { $cpuStart += (Get-Process -Id $id).TotalProcessorTime.TotalMilliseconds }
     $wsSum = 0.0; $privSum = 0.0; $wsPeak = 0.0; $samples = 0; $maxProcs = 0
     $t0 = $sw.ElapsedMilliseconds
-    for ($i = 0; $i -lt $Seconds; $i++) {
-        Start-Sleep -Seconds 1
+    for ($i = 1; $i -le $Seconds; $i++) {
+        # Deadline based: sampling overhead must not stretch the window.
+        $wait = $t0 + 1000 * $i - $sw.ElapsedMilliseconds
+        if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
         $ids = Get-Tree $p.Id
         $maxProcs = [math]::Max($maxProcs, $ids.Count)
         $ws = 0.0; $priv = 0.0
@@ -77,12 +82,14 @@ function Measure-One([string]$Toolkit, [string]$Scenario, [int]$Run) {
         $wsSum += $ws; $privSum += $priv; $wsPeak = [math]::Max($wsPeak, $ws); $samples++
     }
     $cpuEnd = 0.0
+    $alive = $true
     foreach ($id in $ids) {
         $q = Get-Process -Id $id -ErrorAction SilentlyContinue
-        if ($q) { $cpuEnd += $q.TotalProcessorTime.TotalMilliseconds }
+        if ($q) { $cpuEnd += $q.TotalProcessorTime.TotalMilliseconds } else { $alive = $false }
     }
     $wallMs = $sw.ElapsedMilliseconds - $t0
-    $p.WaitForExit(20000) | Out-Null
+    if (-not $alive) { Write-Warning "$Toolkit $Scenario run ${Run}: process exited before sampling finished; row is invalid" }
+    $p.WaitForExit(30000) | Out-Null
     if (-not $p.HasExited) { $p.Kill() }
     $report = (Get-Content $stdout -ErrorAction SilentlyContinue | Select-Object -Last 1)
     $json = if ($report) { $report | ConvertFrom-Json } else { $null }
@@ -99,6 +106,7 @@ function Measure-One([string]$Toolkit, [string]$Scenario, [int]$Run) {
         ws_peak_mib     = [math]::Round($wsPeak / 1MB, 1)
         private_avg_mib = [math]::Round($privSum / $samples / 1MB, 1)
         processes       = $maxProcs
+        valid           = $alive
     }
 }
 
