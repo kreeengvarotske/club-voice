@@ -1,0 +1,18 @@
+# Standalone spike workspace: compares native Rust UI toolkits for the
+# Club Voice desktop client on Windows. Not part of the product workspace.
+[workspace]
+resolver = "3"
+members = ["model", "egui-shell", "slint-shell", "iced-shell"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

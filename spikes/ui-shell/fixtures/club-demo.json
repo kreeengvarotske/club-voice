@@ -1,0 +1,34 @@
+{
+  "Ok": {
+    "current_room": 1,
+    "member_id": 17,
+    "role": "moderator",
+    "voice_epoch": 9,
+    "rooms": [
+      {"id":0,"name":"Lobby","parent":null,"access":{"manager_entry":false,"manager_voice":false},"locked":false,"members":[
+        {"id":30,"name":"Даша","role":"member"},
+        {"id":31,"name":"Ilya","role":"member"}
+      ]},
+      {"id":1,"name":"Team A","parent":null,"access":{"manager_entry":false,"manager_voice":false},"locked":false,"members":[
+        {"id":17,"name":"Alex","role":"moderator"},
+        {"id":21,"name":"Костя","role":"member"},
+        {"id":22,"name":"Лена","role":"member"},
+        {"id":23,"name":"Тимур","role":"room_manager"}
+      ]},
+      {"id":3,"name":"Briefing","parent":1,"access":{"manager_entry":false,"manager_voice":true},"locked":true,"members":[]},
+      {"id":2,"name":"Team B","parent":null,"access":{"manager_entry":false,"manager_voice":false},"locked":true,"members":[
+        {"id":40,"name":"Sam","role":"room_manager_moderator"},
+        {"id":41,"name":"Nikita","role":"member"},
+        {"id":42,"name":"Oleg","role":"member"},
+        {"id":43,"name":"Vera","role":"member"},
+        {"id":44,"name":"Rustam","role":"member"}
+      ]},
+      {"id":4,"name":"Staff","parent":null,"access":{"manager_entry":true,"manager_voice":true},"locked":false,"members":[
+        {"id":1,"name":"Club admin","role":"owner"}
+      ]},
+      {"id":5,"name":"AFK","parent":null,"access":{"manager_entry":false,"manager_voice":true},"locked":false,"members":[
+        {"id":50,"name":"Сергей","role":"member"}
+      ]}
+    ]
+  }
+}

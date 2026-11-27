@@ -1,0 +1,13 @@
+[package]
+name = "cv-shell-iced"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+cv-ui-model = { path = "../model" }
+iced = { version = "0.14", features = ["tokio"] }
+
+[lints]
+workspace = true
